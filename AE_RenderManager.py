@@ -322,10 +322,19 @@ class RenderJob:
 # ══════════════════════════════════════════════════════════════════════════════
 #  PERSISTENCE
 # ══════════════════════════════════════════════════════════════════════════════
+MAX_HISTORY_JOBS = 200   # max completed jobs kept in history file
+
 def save_history(jobs: dict):
     try:
+        all_jobs = [j.to_dict() for j in jobs.values()]
+        # Prune: keep ALL active/failed/stopped jobs + newest N completed
+        active  = [d for d in all_jobs if d.get("status") != "Completed"]
+        done    = [d for d in all_jobs if d.get("status") == "Completed"]
+        # Sort completed by submitted_epoch descending, keep newest
+        done.sort(key=lambda d: d.get("submitted_epoch", 0), reverse=True)
+        pruned  = active + done[:MAX_HISTORY_JOBS]
         with open(HISTORY_FILE, "w") as f:
-            json.dump([j.to_dict() for j in jobs.values()], f, indent=2)
+            json.dump(pruned, f, indent=2)
     except Exception as e:
         log.error(f"Save history failed: {e}")
 
@@ -695,7 +704,13 @@ class FrameWatcher(QThread):
 # ══════════════════════════════════════════════════════════════════════════════
 def dispatch_to_slave(host: str, job: RenderJob,
                       start_frame: int = None, end_frame: int = None,
-                      port: int = SLAVE_PORT) -> bool:
+                      port: int = SLAVE_PORT,
+                      reported_ip: str = None) -> bool:
+    """
+    Send a RENDER command to a slave over TCP.
+    Tries `host` (client_address) first, then `reported_ip` (slave's self-reported IP)
+    as a fallback for multi-NIC / NAT studio environments.
+    """
     sf = start_frame if start_frame is not None else job.start_frame
     ef = end_frame   if end_frame   is not None else job.end_frame
     payload = json.dumps(dict(
@@ -703,19 +718,56 @@ def dispatch_to_slave(host: str, job: RenderJob,
         project_path=job.project_path, output_path=job.output_path,
         start_frame=sf, end_frame=ef, rq_index=job.rq_index,
     )).encode()
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(6); s.connect((host, port)); s.sendall(payload); s.close()
-        return True
-    except Exception as e:
-        log.warning(f"dispatch_to_slave {host}: {e}"); return False
 
-def stop_slave_render(host: str, port: int = SLAVE_PORT):
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(4); s.connect((host, port))
-        s.sendall(json.dumps({"action": "STOP"}).encode()); s.close()
-    except: pass
+    targets = [host]
+    if reported_ip and reported_ip != host and not reported_ip.startswith("127."):
+        targets.append(reported_ip)
+
+    for target in targets:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(6)
+            s.connect((target, port))
+            s.sendall(payload)
+            # Read slave's response to confirm it accepted (not "busy")
+            s.settimeout(4)
+            resp_data = b""
+            try:
+                while True:
+                    chunk = s.recv(1024)
+                    if not chunk: break
+                    resp_data += chunk
+                    if len(resp_data) > 512: break  # enough to parse status
+            except: pass
+            s.close()
+            if resp_data:
+                try:
+                    resp = json.loads(resp_data.decode())
+                    if resp.get("status") == "busy":
+                        log.warning(f"dispatch_to_slave {target}: slave busy, trying next")
+                        continue   # try next target
+                except: pass
+            if target != host:
+                log.info(f"dispatch_to_slave: connected via reported_ip {target} (not {host})")
+            return True
+        except Exception as e:
+            log.debug(f"dispatch_to_slave {target}:{port} failed: {e}")
+
+    log.warning(f"dispatch_to_slave: all targets failed for slave {host}")
+    return False
+
+def stop_slave_render(host: str, port: int = SLAVE_PORT,
+                      reported_ip: str = None):
+    targets = [host]
+    if reported_ip and reported_ip != host and not reported_ip.startswith("127."):
+        targets.append(reported_ip)
+    for target in targets:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(4); s.connect((target, port))
+            s.sendall(json.dumps({"action": "STOP"}).encode()); s.close()
+            return  # sent successfully
+        except: pass
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  AUTO DEBUG ENGINE
@@ -787,8 +839,9 @@ class AutoDebugEngine(QThread):
                         f"[AUTO-DEBUG] {reason} — no idle slaves available, marking FAILED")
                     self.sig_status.emit(jid, JS.FAILED)
                     continue
+                alt_hn = self._slaves.get(alt, {}).get("hostname", alt)
                 self.sig_log.emit(jid,
-                    f"[AUTO-DEBUG] {reason} — retry {retries+1}/{MAX_RETRIES} -> {alt}")
+                    f"[AUTO-DEBUG] {reason} — retry {retries+1}/{MAX_RETRIES} -> {alt_hn}")
                 self.sig_retry.emit(jid, job.current_frame, job.end_frame, alt)
 
     def stop(self): self._run = False
@@ -1351,10 +1404,17 @@ class AERenderManager(QMainWindow):
         save_history(self.jobs)
 
     def _on_slave_update(self, msg: dict):
+        # "host" = client_address[0] set by HTTP handler (the IP the request arrived from)
         host = msg.get("host", "")
         if not host: return
         msg["last_seen"] = time.time()
-        # Merge with existing so we don't lose fields on partial updates
+        # Also store slave's self-reported IP for multi-NIC / NAT environments.
+        # We keep the dict keyed by client_address (most reliable for inbound connections)
+        # but record reported_ip so dispatch can try it as a fallback.
+        reported_ip = msg.get("ip", "")
+        if reported_ip and not reported_ip.startswith("127."):
+            msg["reported_ip"] = reported_ip
+        # Merge with existing so we don't lose fields sent only on /register
         existing = self.slaves.get(host, {})
         existing.update(msg)
         self.slaves[host] = existing
@@ -1366,14 +1426,60 @@ class AERenderManager(QMainWindow):
             if msg_type == "JOB_DONE":
                 job.status = JS.COMPLETED; job.progress = 100
                 job.finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                self._add_log(job, f"Slave {host} completed job.")
+                hn = self._ip_to_hostname(host)
+                self._add_log(job, f"Slave {hn} completed job.")
                 self._update_job_row(job); self.frame_watcher.unregister(job_id)
                 self._update_counts()
+                # This slave is now idle — auto-dispatch next Pending job if any
+                self._auto_dispatch_pending(host)
+
+            elif msg_type == "JOB_STOPPED":
+                # MGR-10: slave confirmed it stopped — ensure job reflects PAUSED/STOPPED
+                if job.status == JS.RENDERING:
+                    # Spontaneous stop (slave crash or OOM) — mark failed
+                    self._add_log(job, f"Slave {self._ip_to_hostname(host)} stopped unexpectedly")
+                    job.status = JS.FAILED
+                    self._update_job_row(job); self._update_counts()
+                # If job was already PAUSED by user action, leave it as PAUSED
             elif msg_type == "JOB_FAILED":
                 job.errors += 1
-                self._add_log(job, f"Slave {host} reported FAILED.")
-                if not job.auto_debug:
-                    job.status = JS.FAILED; self._update_job_row(job); self._update_counts()
+                hn = self._ip_to_hostname(host)
+                self._add_log(job, f"Slave {hn} reported FAILED.")
+                if job.auto_debug:
+                    # MGR-06: directly trigger retry — don't wait for AutoDebugEngine poll
+                    retries = job.frame_retries.get(job.current_frame, 0)
+                    if retries >= MAX_RETRIES:
+                        self._add_log(job,
+                            f"[AUTO-DEBUG] MAX_RETRIES={MAX_RETRIES} reached — marking FAILED")
+                        job.status = JS.FAILED
+                        self._update_job_row(job); self._update_counts()
+                    else:
+                        job.frame_retries[job.current_frame] = retries + 1
+                        # Find an idle slave that is not the one that just failed
+                        now2 = time.time()
+                        alt = next(
+                            (h for h, si in self.slaves.items()
+                             if h != host and
+                                si.get("status") == "Idle" and
+                                (now2 - si.get("last_seen", 0)) < SLAVE_TIMEOUT),
+                            None)
+                        if alt:
+                            self._add_log(job,
+                                f"[AUTO-DEBUG] Retry {retries+1}/{MAX_RETRIES} "
+                                f"-> {self._ip_to_hostname(alt)}")
+                            info2 = self.slaves.get(alt, {})
+                            self._on_auto_retry(job.id, job.current_frame,
+                                                job.end_frame, alt)
+                        else:
+                            self._add_log(job,
+                                "[AUTO-DEBUG] No idle slaves — marking FAILED")
+                            job.status = JS.FAILED
+                            self._update_job_row(job); self._update_counts()
+                else:
+                    job.status = JS.FAILED
+                    self._update_job_row(job); self._update_counts()
+                    # Slave is now idle — auto-dispatch next pending job
+                    self._auto_dispatch_pending(host)
             elif msg_type == "PROGRESS":
                 frame = int(msg.get("current_frame", job.current_frame))
                 pct   = int(msg.get("progress",      job.progress))
@@ -1390,6 +1496,41 @@ class AERenderManager(QMainWindow):
         self._farm_lbl.setText(f"Farm: Online  {online}/{n} Nodes")
         col = "#3CBA54" if online else "#FF5555"
         self._farm_lbl.setStyleSheet(f"color:{col};font-size:11px;background:transparent;")
+
+        # MGR-01: When a slave becomes idle/available, auto-dispatch any Pending jobs
+        # that have this slave in their assigned_workers list (or have no preference).
+        slave_status = msg.get("status", "")
+        if slave_status == "Idle" or msg_type == "SLAVE_CONNECT":
+            self._auto_dispatch_pending(host)
+
+    def _auto_dispatch_pending(self, newly_idle_ip: str):
+        """
+        Called whenever a slave reports Idle or first connects.
+        Finds the highest-priority Pending job assigned to (or compatible with)
+        that slave and dispatches it automatically.
+        """
+        now = time.time()
+        info = self.slaves.get(newly_idle_ip, {})
+        if (now - info.get("last_seen", 0)) > SLAVE_TIMEOUT:
+            return  # slave isn't actually alive
+
+        # Collect all Pending jobs, sorted by priority descending then submitted time
+        pending = [j for j in self.jobs.values() if j.status == JS.PENDING]
+        if not pending:
+            return
+        pending.sort(key=lambda j: (-j.priority, j.submitted_epoch))
+
+        for job in pending:
+            # Check if this slave is eligible for this job
+            if job.assigned_workers:
+                if newly_idle_ip not in job.assigned_workers:
+                    continue  # job is restricted to other slaves
+            # Dispatch
+            self._add_log(job,
+                f"[AUTO-DISPATCH] Slave {self._ip_to_hostname(newly_idle_ip)} "
+                f"became available — dispatching automatically")
+            self._do_render_job(job, job.assigned_workers or [newly_idle_ip])
+            return  # dispatch one job per idle event; next idle event handles next job
 
     def _on_frame_file_update(self, jid: str, count: int):
         job = self.jobs.get(jid)
@@ -1438,14 +1579,19 @@ class AERenderManager(QMainWindow):
     def _on_auto_retry(self, jid: str, sf: int, ef: int, target: str):
         job = self.jobs.get(jid)
         if not job: return
-        self._add_log(job, f"[AUTO-RETRY] frames {sf}-{ef} -> {target}")
+        hn = self._ip_to_hostname(target)
+        self._add_log(job, f"[AUTO-RETRY] frames {sf}-{ef} -> {hn}")
         # Kill current slave render if any
         if job.assigned_to and job.assigned_to != target:
-            stop_slave_render(job.assigned_to)
+            info = self.slaves.get(job.assigned_to, {})
+            stop_slave_render(job.assigned_to,
+                              reported_ip=info.get("reported_ip"))
         job.assigned_to = target
         job.status = JS.RENDERING; self._update_job_row(job)
-        if not dispatch_to_slave(target, job, sf, ef):
-            self._add_log(job, f"[AUTO-RETRY] {target} dispatch failed — marking FAILED")
+        info = self.slaves.get(target, {})
+        if not dispatch_to_slave(target, job, sf, ef,
+                                 reported_ip=info.get("reported_ip")):
+            self._add_log(job, f"[AUTO-RETRY] {hn} dispatch failed — marking FAILED")
             job.status = JS.FAILED; self._update_job_row(job); self._update_counts()
 
     # ── TABLE HELPERS ─────────────────────────────────────────────────────────
@@ -1648,11 +1794,32 @@ class AERenderManager(QMainWindow):
         e = int(time.time() - self._start_t)
         d = e // 86400; h = (e % 86400) // 3600; m = (e % 3600) // 60; s = e % 60
         self._sb_up.setText(f"  Uptime: {d}d {h:02d}h {m:02d}m {s:02d}s")
-        # Mark stale slaves offline
         now = time.time()
-        for info in self.slaves.values():
+        # Mark stale slaves offline
+        newly_offline = []
+        for ip, info in self.slaves.items():
+            was_alive = info.get("status") != "Offline"
             if (now - info.get("last_seen", 0)) > SLAVE_TIMEOUT:
-                info["status"] = "Offline"
+                if was_alive:
+                    info["status"] = "Offline"
+                    newly_offline.append(ip)
+        # If a slave went offline while it owned a rendering job, handle it
+        for ip in newly_offline:
+            for job in self.jobs.values():
+                if job.assigned_to == ip and job.status == JS.RENDERING:
+                    self._add_log(job,
+                        f"[WARN] Slave {self._ip_to_hostname(ip)} went offline mid-render")
+                    if job.auto_debug:
+                        # AutoDebugEngine will catch this on its next 15s cycle,
+                        # but we can also emit immediately to reduce wait
+                        pass  # let AutoDebugEngine handle it
+                    else:
+                        job.status = JS.FAILED
+                        self._update_job_row(job)
+        # Refresh worker table every 5 ticks (5 seconds) for age column
+        self._tick_count = getattr(self, '_tick_count', 0) + 1
+        if self._tick_count % 5 == 0:
+            self._refresh_workers()
         if self._dirty and self._sel_jid:
             job = self.jobs.get(self._sel_jid)
             if job: self._update_task_pane_live(job)
@@ -1828,8 +1995,20 @@ class AERenderManager(QMainWindow):
             self.frame_watcher.register(job.id, job.output_path,
                                         job.start_frame, job.end_frame)
 
-        # Try each assigned slave in order until one accepts
+        # If no specific slaves assigned, use all currently idle slaves
         now = time.time()
+        if not assigned_ips:
+            assigned_ips = [
+                h for h, info in self.slaves.items()
+                if (now - info.get("last_seen", 0)) < SLAVE_TIMEOUT
+                and info.get("status") == "Idle"
+            ]
+            if not assigned_ips:
+                job.status = JS.PENDING
+                self._add_log(job, "No idle slaves available — job queued as Pending")
+                self._update_job_row(job); self._update_counts()
+                return
+        # Try each assigned slave in order until one accepts
         for ip in assigned_ips:
             info  = self.slaves.get(ip, {})
             alive = (now - info.get("last_seen", 0)) < SLAVE_TIMEOUT
@@ -1837,7 +2016,8 @@ class AERenderManager(QMainWindow):
                 self._add_log(job, f"Slave {info.get('hostname', ip)} is offline, skipping")
                 continue
             self._add_log(job, f"Dispatching to {info.get('hostname', ip)}")
-            if dispatch_to_slave(ip, job):
+            if dispatch_to_slave(ip, job,
+                                 reported_ip=info.get("reported_ip")):
                 job.assigned_to = ip
                 job.status      = JS.RENDERING
                 self._update_job_row(job)
@@ -1971,27 +2151,34 @@ class AERenderManager(QMainWindow):
     def _retry_failed(self):
         for job in list(self.jobs.values()):
             if job.status in (JS.FAILED, JS.STOPPED):
-                job.status = JS.PENDING; job.progress = 0
-                job.errors = 0; job.frame_retries.clear()
-                self._add_log(job, "[RETRY]"); self._update_job_row(job)
+                job.status       = JS.PENDING
+                job.progress     = 0
+                job.errors       = 0
+                job.current_frame= job.start_frame
+                job.frame_retries.clear()
+                job.frame_status.clear()   # MGR-09: clear stale frame display
+                job.started_at   = ""
+                job.finished_at  = ""
+                self._add_log(job, "[RETRY] Reset for re-render")
+                self._update_job_row(job)
         self._update_counts()
 
     def _clear_done(self):
-        # Only clears Completed jobs from the view — Stopped/Failed stay
-        # (nothing is deleted, just hidden from the table; history JSON is untouched)
+        """Remove Completed jobs from the live view and persist the change."""
         for jid in list(self.jobs.keys()):
             job = self.jobs.get(jid)
             if not job or job.status != JS.COMPLETED: continue
             if 0 <= job._table_row < self.job_table.rowCount():
                 self.job_table.removeRow(job._table_row)
             del self.jobs[jid]
-        # Re-index
+        # Re-index remaining rows
         for i in range(self.job_table.rowCount()):
             it = self.job_table.item(i, 0)
             if it:
                 jid = it.data(Qt.UserRole)
                 if jid and jid in self.jobs: self.jobs[jid]._table_row = i
         self._update_counts()
+        save_history(self.jobs)  # MGR-05: persist so cleared jobs don't reappear
 
     def _set_priority_dialog(self):
         ids = self._get_selected_job_ids()

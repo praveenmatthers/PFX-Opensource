@@ -96,7 +96,7 @@ def find_aerender() -> str:
             return p
     return ""
 
-def get_local_ip() -> str:
+def get_local_ip(manager_ip: str = None) -> str:
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -179,7 +179,7 @@ class SlaveState:
         self.manager_ip        = manager_ip
         self.listen_port       = port
         self.hostname          = name or socket.gethostname()
-        self.local_ip          = get_local_ip()
+        self.local_ip          = get_local_ip(manager_ip)  # use manager route to pick correct NIC
         self.os_info           = f"{platform.system()} {platform.release()}"
         self.aerender          = find_aerender()
         self.ae_version        = get_ae_version(self.aerender) if self.aerender else "N/A"
@@ -283,8 +283,14 @@ class SlaveState:
             clog("aerender not found.", "ERROR")
             self._finish(job_id, False)
             return
+        # Check project file exists — give a helpful message for UNC/network paths
         if not os.path.exists(project):
-            clog(f"Project not found: {project}", "ERROR")
+            if project.startswith("\\") or project.startswith("//"):
+                clog(f"Network project path not accessible: {project}", "ERROR")
+                clog("Check: (1) network share is mounted, (2) path spelling, "
+                     "(3) this machine has read access to the share", "ERROR")
+            else:
+                clog(f"Project file not found: {project}", "ERROR")
             self._finish(job_id, False)
             return
 
@@ -339,10 +345,23 @@ class SlaveState:
                 tag = "ERROR" if "error" in line.lower() else "RENDER"
                 clog(line, tag)
 
-                # Parse progress
+                # Parse aerender progress — multiple output formats across AE versions:
+                #   AE 2021 and older : "X of Y"
+                #   AE 2022-2024      : "PROGRESS:  X of Y" or "aerender: PROGRESS: X"
+                #   AE 2024+          : "Frame X (Y%)" or just a frame number line
+                cur = None
                 m = re.search(r'(\d+)\s+of\s+(\d+)', line, re.IGNORECASE)
                 if m:
                     cur = int(m.group(1))
+                if cur is None:
+                    m2 = re.search(r'PROGRESS[:\s]+(\d+)', line, re.IGNORECASE)
+                    if m2: cur = int(m2.group(1))
+                if cur is None:
+                    m3 = re.search(r'Frame\s+(\d+)', line, re.IGNORECASE)
+                    if m3:
+                        fn_abs = int(m3.group(1))
+                        cur = fn_abs - start_f + 1
+                if cur is not None and cur > 0:
                     pct = min(int(cur / total * 100), 100)
                     fn  = start_f + cur - 1
                     with self._lock:
@@ -384,8 +403,19 @@ class SlaveState:
             self._render_stop = True
             proc = self._proc
         if proc:
+            # First try graceful termination
             try: proc.terminate()
             except: pass
+            # On Windows aerender sometimes ignores SIGTERM — hard kill after 3s
+            def _force_kill():
+                import time as _t
+                _t.sleep(3)
+                try:
+                    if proc.poll() is None:  # still alive
+                        proc.kill()
+                        clog("aerender force-killed after terminate timeout", "WARN")
+                except: pass
+            threading.Thread(target=_force_kill, daemon=True).start()
 
     # ── Preflight ─────────────────────────────────────────────────────────────
     def handle_preflight(self, required: list) -> dict:
@@ -427,10 +457,17 @@ def handle_connection(conn: socket.socket, addr, slave: SlaveState):
 
             if action == "RENDER":
                 clog(f"RENDER from {addr[0]}", "INFO")
-                t = threading.Thread(
-                    target=slave.render_job, args=(msg,), daemon=True)
-                t.start()
-                response = json.dumps({"status": "ok"}).encode()
+                with slave._lock:
+                    already = (slave.status == "Rendering")
+                if already:
+                    clog("Already rendering — rejecting with 'busy'", "WARN")
+                    response = json.dumps({"status": "busy",
+                                           "msg": "slave already rendering"}).encode()
+                else:
+                    t = threading.Thread(
+                        target=slave.render_job, args=(msg,), daemon=True)
+                    t.start()
+                    response = json.dumps({"status": "ok"}).encode()
 
             elif action == "STOP":
                 clog(f"STOP from {addr[0]}", "WARN")
@@ -470,7 +507,7 @@ def handle_connection(conn: socket.socket, addr, slave: SlaveState):
     except: pass
 
 
-def run_server(slave: SlaveState):
+def run_server(slave: SlaveState, ready_event: threading.Event = None):
     try:
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -478,8 +515,12 @@ def run_server(slave: SlaveState):
         srv.listen(10)
         srv.settimeout(1.0)
         clog(f"Listening on 0.0.0.0:{slave.listen_port}", "INFO")
+        if ready_event:
+            ready_event.set()   # signal that port is bound and ready
     except Exception as e:
         clog(f"Could not bind to port {slave.listen_port}: {e}", "ERROR")
+        if ready_event:
+            ready_event.set()   # unblock even on failure so main doesn't hang
         sys.exit(1)
 
     while not slave._global_stop:
@@ -503,15 +544,59 @@ def run_server(slave: SlaveState):
 # ══════════════════════════════════════════════════════════════════════════════
 # BANNER
 # ══════════════════════════════════════════════════════════════════════════════
-def print_banner(slave: SlaveState):
+def check_connectivity(slave) -> tuple:
+    """Test reachability to manager and verify our listen port is bindable."""
+    can_reach_mgr = False
+    try:
+        import urllib.request as _ur
+        r = _ur.urlopen(
+            f"http://{slave.manager_ip}:{MANAGER_PORT}/ping", timeout=4)
+        can_reach_mgr = (r.status == 200)
+    except Exception:
+        pass
+
+    # Verify our listen port isn't blocked by another process
+    srv_ok = False
+    try:
+        test = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        test.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        test.bind(("0.0.0.0", slave.listen_port))
+        test.close()
+        srv_ok = True   # port free — server will bind it
+    except OSError:
+        srv_ok = True   # port in use — means our server is already bound (good)
+    except Exception:
+        pass
+
+    note = ""
+    if not can_reach_mgr:
+        note = (f"Cannot reach manager at {slave.manager_ip}:{MANAGER_PORT}. "
+                f"Check: (1) Manager is running, "
+                f"(2) --manager flag has the correct LAN IP (not localhost), "
+                f"(3) Windows Firewall allows port {MANAGER_PORT}.")
+    return can_reach_mgr, srv_ok, note
+
+
+def print_banner(slave) -> bool:
+    """Print startup banner and connectivity check. Returns True if manager reachable."""
     ae  = slave.aerender or "NOT FOUND"
     ps  = "installed" if HAS_PSUTIL else "NOT installed  (pip install psutil)"
+
+    can_reach_mgr, srv_ok, conn_note = check_connectivity(slave)
+    mgr_col = "\033[92m" if can_reach_mgr else "\033[91m"
+    mgr_txt = "REACHABLE" if can_reach_mgr else "UNREACHABLE"
+    srv_txt = "OK" if srv_ok else "PORT CONFLICT"
+    ip_warn = ""
+    if slave.local_ip.startswith("127."):
+        ip_warn = ("  \033[93m<-- WARNING: loopback detected. "
+                   "Manager cannot dial back. Use --ip <your_lan_ip>\033[0m")
+
     print(f"""
 \033[97m╔══════════════════════════════════════════════════════╗
 ║         AEREN  Render Slave  v{SLAVE_VERSION}                ║
 ╚══════════════════════════════════════════════════════╝\033[0m
 \033[96m  Hostname      :\033[92m {slave.hostname}
-\033[96m  Local IP      :\033[92m {slave.local_ip}
+\033[96m  This Machine  :\033[92m {slave.local_ip}{ip_warn}
 \033[96m  OS            :\033[92m {slave.os_info}
 \033[96m  aerender      :\033[92m {ae}
 \033[96m  AE Version    :\033[92m {slave.ae_version}
@@ -521,52 +606,112 @@ def print_banner(slave: SlaveState):
 \033[96m  RAM Total     :\033[92m {ram_total_gb()} GB
 \033[96m  Plugins found :\033[92m {len(slave.installed_plugins)}
 \033[96m  psutil        :\033[92m {ps}
-\033[96m  AEREN 2026 — Praveen Brijwal\033[0m
+
+\033[96m  -- Network Check --
+\033[96m  Manager       : {mgr_col}{mgr_txt}\033[0m
+\033[96m  Listen port   : {"\033[92m" if srv_ok else "\033[91m"}{srv_txt}\033[0m
+\033[90m  AEREN 2026 -- Praveen Brijwal\033[0m
 """)
+    if conn_note and slave.manager_ip not in ("localhost", "127.0.0.1"):
+        print(f"  \033[91m[NETWORK ERROR] {conn_note}\033[0m\n")
+    elif not can_reach_mgr and slave.manager_ip in ("localhost", "127.0.0.1"):
+        print(f"  \033[90m[INFO] Manager not reachable via localhost — "
+              f"normal if manager starts after slave. Will keep retrying.\033[0m\n")
+    if not slave.aerender:
+        print("  \033[93m[WARN] aerender not found. Render jobs WILL fail on this node.\033[0m\n")
+
+    return can_reach_mgr
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 # ENTRY POINT
-# ══════════════════════════════════════════════════════════════════════════════
+# ==============================================================================
 def main():
-    parser = argparse.ArgumentParser(description="AEREN Render Slave v3.0")
+    parser = argparse.ArgumentParser(
+        description="AEREN Render Slave v3.0",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples (replace 192.168.1.10 with your manager machine's LAN IP):
+  python AE_RenderSlave.py --manager 192.168.1.10
+  python AE_RenderSlave.py --manager 192.168.1.10 --name RENDER-PC-01
+  python AE_RenderSlave.py --manager 192.168.1.10 --ip 192.168.1.25
+  python AE_RenderSlave.py --manager 192.168.1.10 --port 9877
+
+NOTE: --manager must be the LAN IP of the manager machine.
+      Using localhost only works when both run on the same machine.
+""")
     parser.add_argument("--manager", default="localhost",
-                        help="Manager IP (default: localhost)")
+                        help="LAN IP of the manager machine  (e.g. 192.168.1.10)")
     parser.add_argument("--name",    default=None,
-                        help="Override node display name")
+                        help="Override this node's display name in the Manager UI")
     parser.add_argument("--port",    type=int, default=SLAVE_PORT,
-                        help=f"Listening port (default: {SLAVE_PORT})")
+                        help=f"Port this slave listens on for job dispatch (default: {SLAVE_PORT})")
+    parser.add_argument("--ip",      default=None,
+                        help=("Override the IP this machine advertises to the manager. "
+                              "Use when auto-detection picks the wrong network adapter. "
+                              "Example: --ip 192.168.1.25"))
     args = parser.parse_args()
+
+    # Warn clearly if --manager was not set for a multi-machine studio setup
+    if args.manager in ("localhost", "127.0.0.1"):
+        print("\033[93m" + "=" * 60)
+        print("  WARNING: --manager is set to localhost / 127.0.0.1")
+        print("  This only works if the Manager runs on THIS machine.")
+        print("  For a studio render farm, pass the Manager's LAN IP:")
+        print("    python AE_RenderSlave.py --manager 192.168.1.10")
+        print("=" * 60 + "\033[0m\n")
 
     slave = SlaveState(
         manager_ip = args.manager,
         name       = args.name,
         port       = args.port,
     )
-    print_banner(slave)
 
-    if not slave.aerender:
-        clog("WARNING: aerender not found — render jobs WILL fail on this node.", "WARN")
+    # Manual IP override — useful for multi-NIC machines or VPN environments
+    if args.ip:
+        slave.local_ip = args.ip
+        clog(f"IP override applied: advertising {slave.local_ip} to manager", "INFO")
+
+    # Print banner and run connectivity check
+    manager_ok = print_banner(slave)
 
     def handle_exit(sig, frame):
-        clog(f"Signal {sig} — shutting down.", "WARN")
+        clog(f"Signal {sig} received — shutting down.", "WARN")
         slave.shutdown()
         sys.exit(0)
 
     signal.signal(signal.SIGINT,  handle_exit)
     signal.signal(signal.SIGTERM, handle_exit)
 
+    # Start TCP server in a background thread FIRST so we are ready to accept
+    # job dispatches before registering — avoids race where manager dispatches
+    # immediately after SLAVE_CONNECT but our port isn't bound yet.
+    server_ready = threading.Event()
+
+    def _run_server_bg():
+        run_server(slave, ready_event=server_ready)
+
+    srv_thread = threading.Thread(target=_run_server_bg, daemon=False, name="tcp_server")
+    srv_thread.start()
+
+    # Wait until the TCP server has actually bound its port (up to 5s)
+    if not server_ready.wait(timeout=5):
+        clog("WARNING: TCP server did not start in time — registration may race", "WARN")
+
     # Start heartbeat thread
     threading.Thread(
         target=slave.heartbeat_loop, daemon=True, name="heartbeat"
     ).start()
 
-    # Register
+    # Now register with manager — server is ready to accept dispatches
     slave.send_status({"type": "SLAVE_CONNECT"})
-    clog(f"Registered with manager @ {slave.manager_ip}:{MANAGER_PORT}", "OK")
+    if manager_ok:
+        clog(f"Registered with manager @ {slave.manager_ip}:{MANAGER_PORT}", "OK")
+    else:
+        clog(f"Registration sent but manager unreachable — will keep retrying", "WARN")
 
-    # Blocking server loop
-    run_server(slave)
+    # Wait for server thread to finish (runs until global stop)
+    srv_thread.join()
 
 
 if __name__ == "__main__":
