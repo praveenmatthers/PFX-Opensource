@@ -23,6 +23,27 @@
             .replace(/\t/g, "\\t");
     }
 
+    function toJSON(val) {
+        if (val === null || val === undefined) return "null";
+        if (typeof val === "string") return '"' + escStr(val) + '"';
+        if (typeof val === "number" || typeof val === "boolean") return String(val);
+        if (val instanceof Array) {
+            var arr = [];
+            for (var i = 0; i < val.length; i++) arr.push(toJSON(val[i]));
+            return "[" + arr.join(",") + "]";
+        }
+        if (typeof val === "object") {
+            var obj = [];
+            for (var k in val) {
+                if (val.hasOwnProperty(k)) {
+                    obj.push('"' + escStr(k) + '":' + toJSON(val[k]));
+                }
+            }
+            return "{" + obj.join(",") + "}";
+        }
+        return '""';
+    }
+
     function timestamp() {
         var d = new Date();
         return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) +
@@ -303,47 +324,46 @@
         if (prio > 10) prio = 10;
         var chunkSize = parseInt(chunkEdit.text, 10) || 10;
 
-        // Serialize effects array
-        var effParts = [];
+        var effArr = [];
         for (var ei = 0; ei < requiredEffects.length; ei++) {
-            effParts.push('{"matchName":"' + escStr(requiredEffects[ei].matchName) + '",'
-                + '"displayName":"' + escStr(requiredEffects[ei].displayName) + '"}');
-        }
-        var effArr = "[" + effParts.join(",") + "]";
-
-        // Serialize jobs array
-        function jToJSON(jb) {
-            return '{'
-                + '"comp_name":"' + escStr(jb.comp_name) + '",'
-                + '"project_path":"' + escStr(jb.project_path) + '",'
-                + '"output_path":"' + escStr(jb.output_path) + '",'
-                + '"output_path_orig":"' + escStr(jb.output_path_orig) + '",'
-                + '"start_frame":' + jb.start_frame + ','
-                + '"end_frame":' + jb.end_frame + ','
-                + '"fps":' + jb.fps + ','
-                + '"width":' + jb.width + ','
-                + '"height":' + jb.height + ','
-                + '"duration_frames":' + jb.duration_frames + ','
-                + '"rq_index":' + jb.rq_index + ','
-                + '"hostname":"' + escStr(jb.hostname) + '",'
-                + '"is_video":' + (jb.is_video ? "true" : "false")
-                + '}';
+            effArr.push({
+                matchName: requiredEffects[ei].matchName,
+                displayName: requiredEffects[ei].displayName
+            });
         }
 
-        var jobParts = [];
-        for (var k = 0; k < jobs.length; k++) jobParts.push(jToJSON(jobs[k]));
-        var jobsArr = "[" + jobParts.join(",") + "]";
+        var jobsArr = [];
+        for (var k = 0; k < jobs.length; k++) {
+            var jb = jobs[k];
+            jobsArr.push({
+                comp_name: jb.comp_name,
+                project_path: jb.project_path,
+                output_path: jb.output_path,
+                output_path_orig: jb.output_path_orig,
+                start_frame: jb.start_frame,
+                end_frame: jb.end_frame,
+                fps: jb.fps,
+                width: jb.width,
+                height: jb.height,
+                duration_frames: jb.duration_frames,
+                rq_index: jb.rq_index,
+                hostname: jb.hostname,
+                is_video: !!jb.is_video
+            });
+        }
 
-        var payload = '{'
-            + '"submitted_at":"' + escStr(ts) + '",'
-            + '"machine":"' + escStr(hostname) + '",'
-            + '"user":"' + escStr(username) + '",'
-            + '"project":"' + escStr(copyFsPath) + '",'
-            + '"priority":' + prio + ','
-            + '"chunk_size":' + chunkSize + ','
-            + '"required_effects":' + effArr + ','
-            + '"jobs":' + jobsArr
-            + '}';
+        var payloadObj = {
+            submitted_at: ts,
+            machine: hostname,
+            user: username,
+            project: copyFsPath,
+            priority: prio,
+            chunk_size: chunkSize,
+            required_effects: effArr,
+            jobs: jobsArr
+        };
+
+        var payload = toJSON(payloadObj);
 
         // Write drop-file for manager file-watcher
         var tmpPath = WATCH_DIR + SEP + "ae_render_job_" + now.getTime() + ".json";
