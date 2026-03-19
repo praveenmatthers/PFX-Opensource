@@ -328,51 +328,8 @@ class SlaveState:
             with self._lock:
                 self._proc = proc
 
-            for raw in iter(proc.stdout.readline, ""):
-                # Check stop flags
-                with self._lock:
-                    stop_now = self._render_stop or self._global_stop
-                if stop_now:
-                    clog("Stopping render on request.", "WARN")
-                    try: proc.terminate()
-                    except: pass
-                    self._finish(job_id, False, stopped=True)
-                    return
-
-                line = raw.rstrip()
-                if not line: continue
-
-                tag = "ERROR" if "error" in line.lower() else "RENDER"
-                clog(line, tag)
-
-                # Parse aerender progress — multiple output formats across AE versions:
-                #   AE 2021 and older : "X of Y"
-                #   AE 2022-2024      : "PROGRESS:  X of Y" or "aerender: PROGRESS: X"
-                #   AE 2024+          : "Frame X (Y%)" or just a frame number line
-                cur = None
-                m = re.search(r'(\d+)\s+of\s+(\d+)', line, re.IGNORECASE)
-                if m:
-                    cur = int(m.group(1))
-                if cur is None:
-                    m2 = re.search(r'PROGRESS[:\s]+(\d+)', line, re.IGNORECASE)
-                    if m2: cur = int(m2.group(1))
-                if cur is None:
-                    m3 = re.search(r'Frame\s+(\d+)', line, re.IGNORECASE)
-                    if m3:
-                        fn_abs = int(m3.group(1))
-                        cur = fn_abs - start_f + 1
-                if cur is not None and cur > 0:
-                    pct = min(int(cur / total * 100), 100)
-                    fn  = start_f + cur - 1
-                    with self._lock:
-                        self.current_frame = fn
-                        self.progress      = pct
-                    self.send_status({
-                        "type":          "PROGRESS",
-                        "job_id":        job_id,
-                        "current_frame": fn,
-                        "progress":      pct,
-                    })
+            if self._process_render_output(proc, job_id, start_f, total):
+                return
 
             proc.wait()
             success = (proc.returncode == 0)
@@ -384,6 +341,58 @@ class SlaveState:
         except Exception:
             clog(f"Render exception:\n{traceback.format_exc()}", "ERROR")
             self._finish(job_id, False)
+
+    def _process_render_output(self, proc: subprocess.Popen, job_id: str, start_f: int, total: int) -> bool:
+        """
+        Parses aerender stdout line by line to extract progress and check for stop signals.
+        Returns True if the render was stopped upon request, False otherwise.
+        """
+        for raw in iter(proc.stdout.readline, ""):
+            # Check stop flags
+            with self._lock:
+                stop_now = self._render_stop or self._global_stop
+            if stop_now:
+                clog("Stopping render on request.", "WARN")
+                try: proc.terminate()
+                except: pass
+                self._finish(job_id, False, stopped=True)
+                return True
+
+            line = raw.rstrip()
+            if not line: continue
+
+            tag = "ERROR" if "error" in line.lower() else "RENDER"
+            clog(line, tag)
+
+            # Parse aerender progress — multiple output formats across AE versions:
+            #   AE 2021 and older : "X of Y"
+            #   AE 2022-2024      : "PROGRESS:  X of Y" or "aerender: PROGRESS: X"
+            #   AE 2024+          : "Frame X (Y%)" or just a frame number line
+            cur = None
+            m = re.search(r"(\d+)\s+of\s+(\d+)", line, re.IGNORECASE)
+            if m:
+                cur = int(m.group(1))
+            if cur is None:
+                m2 = re.search(r"PROGRESS[:\s]+(\d+)", line, re.IGNORECASE)
+                if m2: cur = int(m2.group(1))
+            if cur is None:
+                m3 = re.search(r"Frame\s+(\d+)", line, re.IGNORECASE)
+                if m3:
+                    fn_abs = int(m3.group(1))
+                    cur = fn_abs - start_f + 1
+            if cur is not None and cur > 0:
+                pct = min(int(cur / total * 100), 100)
+                fn  = start_f + cur - 1
+                with self._lock:
+                    self.current_frame = fn
+                    self.progress      = pct
+                self.send_status({
+                    "type":          "PROGRESS",
+                    "job_id":        job_id,
+                    "current_frame": fn,
+                    "progress":      pct,
+                })
+        return False
 
     def _finish(self, job_id: str, success: bool, stopped: bool = False):
         msg_type = "JOB_DONE" if success else ("JOB_STOPPED" if stopped else "JOB_FAILED")
