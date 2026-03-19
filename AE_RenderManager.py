@@ -326,10 +326,14 @@ MAX_HISTORY_JOBS = 200   # max completed jobs kept in history file
 
 def save_history(jobs: dict):
     try:
-        all_jobs = [j.to_dict() for j in jobs.values()]
+        active, done = [], []
         # Prune: keep ALL active/failed/stopped jobs + newest N completed
-        active  = [d for d in all_jobs if d.get("status") != "Completed"]
-        done    = [d for d in all_jobs if d.get("status") == "Completed"]
+        for j in jobs.values():
+            d = j.to_dict()
+            if d.get("status") == "Completed":
+                done.append(d)
+            else:
+                active.append(d)
         # Sort completed by submitted_epoch descending, keep newest
         done.sort(key=lambda d: d.get("submitted_epoch", 0), reverse=True)
         pruned  = active + done[:MAX_HISTORY_JOBS]
