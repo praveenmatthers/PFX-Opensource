@@ -624,35 +624,31 @@ class RenderWorker(QThread):
             self.sig_log.emit(job.id, f"[EXCEPTION]\n{traceback.format_exc()}")
             self.sig_status.emit(job.id, JS.FAILED)
 
+    def _set_process_suspended(self, suspend: bool):
+        if self.job.process:
+            try:
+                if platform.system() == "Windows":
+                    import ctypes
+                    h = ctypes.windll.kernel32.OpenProcess(0x001F0FFF, False,
+                                                           self.job.process.pid)
+                    if suspend:
+                        ctypes.windll.kernel32.SuspendThread(h)
+                    else:
+                        ctypes.windll.kernel32.ResumeThread(h)
+                    ctypes.windll.kernel32.CloseHandle(h)
+                else:
+                    import signal as _s
+                    sig = _s.SIGSTOP if suspend else _s.SIGCONT
+                    os.kill(self.job.process.pid, sig)
+            except: pass
+
     def pause(self):
         self._paused = True
         self._pev.clear()
-        if self.job.process:
-            try:
-                if platform.system() == "Windows":
-                    import ctypes
-                    h = ctypes.windll.kernel32.OpenProcess(0x001F0FFF, False,
-                                                           self.job.process.pid)
-                    ctypes.windll.kernel32.SuspendThread(h)
-                    ctypes.windll.kernel32.CloseHandle(h)
-                else:
-                    import signal as _s
-                    os.kill(self.job.process.pid, _s.SIGSTOP)
-            except: pass
+        self._set_process_suspended(True)
 
     def resume(self):
-        if self.job.process:
-            try:
-                if platform.system() == "Windows":
-                    import ctypes
-                    h = ctypes.windll.kernel32.OpenProcess(0x001F0FFF, False,
-                                                           self.job.process.pid)
-                    ctypes.windll.kernel32.ResumeThread(h)
-                    ctypes.windll.kernel32.CloseHandle(h)
-                else:
-                    import signal as _s
-                    os.kill(self.job.process.pid, _s.SIGCONT)
-            except: pass
+        self._set_process_suspended(False)
         self._paused = False
         self._pev.set()
 
