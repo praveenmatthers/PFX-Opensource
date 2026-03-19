@@ -511,10 +511,10 @@ def run_server(slave: SlaveState, ready_event: threading.Event = None):
     try:
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("0.0.0.0", slave.listen_port))
+        srv.bind((slave.local_ip, slave.listen_port))
         srv.listen(10)
         srv.settimeout(1.0)
-        clog(f"Listening on 0.0.0.0:{slave.listen_port}", "INFO")
+        clog(f"Listening on {slave.local_ip}:{slave.listen_port}", "INFO")
         if ready_event:
             ready_event.set()   # signal that port is bound and ready
     except Exception as e:
@@ -560,7 +560,7 @@ def check_connectivity(slave) -> tuple:
     try:
         test = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         test.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        test.bind(("0.0.0.0", slave.listen_port))
+        test.bind((slave.local_ip, slave.listen_port))
         test.close()
         srv_ok = True   # port free — server will bind it
     except OSError:
