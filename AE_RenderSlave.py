@@ -175,8 +175,9 @@ def check_plugins(required: list, installed_set: set) -> dict:
 # SLAVE STATE
 # ══════════════════════════════════════════════════════════════════════════════
 class SlaveState:
-    def __init__(self, manager_ip: str, name: str, port: int):
+    def __init__(self, manager_ip: str, name: str, port: int, secret: str = ""):
         self.manager_ip        = manager_ip
+        self.secret            = secret
         self.listen_port       = port
         self.hostname          = name or socket.gethostname()
         self.local_ip          = get_local_ip(manager_ip)  # use manager route to pick correct NIC
@@ -199,6 +200,7 @@ class SlaveState:
     def _build_payload(self, extra: dict = None) -> dict:
         with self._lock:
             p = dict(
+                secret        = self.secret,
                 type          = "SLAVE_STATUS",
                 hostname      = self.hostname,
                 ip            = self.local_ip,
@@ -455,6 +457,13 @@ def handle_connection(conn: socket.socket, addr, slave: SlaveState):
             msg    = json.loads(data.decode())
             action = msg.get("action", "")
 
+            if slave.secret and msg.get("secret") != slave.secret:
+                clog(f"Unauthorized connection attempt from {addr[0]}", "WARN")
+                response = json.dumps({"status": "unauthorized", "error": "unauthorized"}).encode()
+                conn.sendall(response)
+                conn.close()
+                return
+
             if action == "RENDER":
                 clog(f"RENDER from {addr[0]}", "INFO")
                 with slave._lock:
@@ -650,6 +659,8 @@ NOTE: --manager must be the LAN IP of the manager machine.
                         help=("Override the IP this machine advertises to the manager. "
                               "Use when auto-detection picks the wrong network adapter. "
                               "Example: --ip 192.168.1.25"))
+    parser.add_argument("--secret",  default="",
+                        help="Shared secret for API and TCP authentication")
     args = parser.parse_args()
 
     # Warn clearly if --manager was not set for a multi-machine studio setup
@@ -665,6 +676,7 @@ NOTE: --manager must be the LAN IP of the manager machine.
         manager_ip = args.manager,
         name       = args.name,
         port       = args.port,
+        secret     = args.secret,
     )
 
     # Manual IP override — useful for multi-NIC machines or VPN environments

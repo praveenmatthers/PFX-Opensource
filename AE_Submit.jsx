@@ -8,6 +8,7 @@
 
     var DEFAULT_HOST = "127.0.0.1";
     var DEFAULT_PORT = 9876;
+    var MANAGER_SECRET = "";
     var WATCH_DIR = Folder.temp.fsName;
     var SEP = ($.os.indexOf("Windows") !== -1) ? "\\" : "/";
 
@@ -330,6 +331,7 @@
         var jobsArr = "[" + jobParts.join(",") + "]";
 
         var payload = '{'
+            + '"secret":"' + escStr(MANAGER_SECRET) + '",'
             + '"submitted_at":"' + escStr(ts) + '",'
             + '"machine":"' + escStr(hostname) + '",'
             + '"user":"' + escStr(username) + '",'

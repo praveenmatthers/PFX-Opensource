@@ -16,6 +16,7 @@ Run: python AE_RenderManager.py
 # ── Network ───────────────────────────────────────────────────────────────────
 MANAGER_PORT  = 9876        # Port the manager listens on (HTTP + slave TCP)
 SLAVE_PORT    = 9877        # Port each slave listens on for job dispatch
+MANAGER_SECRET = ""         # Shared secret for API and TCP authentication
 
 # ── aerender executable ───────────────────────────────────────────────────────
 # Primary path — set this to your AE version first
@@ -351,7 +352,7 @@ def load_history():
 def check_slave_plugins(slave_ip: str, slave_port: int,
                         required: list, timeout: int = 8) -> dict:
     if not required: return {}
-    payload = json.dumps({"action": "PREFLIGHT", "required": required}).encode()
+    payload = json.dumps({"secret": MANAGER_SECRET, "action": "PREFLIGHT", "required": required}).encode()
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
@@ -435,6 +436,10 @@ class ManagerHTTPHandler(BaseHTTPRequestHandler):
         try:
             data       = self._read_json()
             client_ip  = self.client_address[0]
+
+            if MANAGER_SECRET and data.get("secret") != MANAGER_SECRET:
+                self.send_json({"error": "unauthorized"}, 401)
+                return
 
             # ── Job submission from AE_Submit.jsx (curl) ──────────────────────
             if self.path == "/submit":
@@ -714,7 +719,7 @@ def dispatch_to_slave(host: str, job: RenderJob,
     sf = start_frame if start_frame is not None else job.start_frame
     ef = end_frame   if end_frame   is not None else job.end_frame
     payload = json.dumps(dict(
-        action="RENDER", job_id=job.id, comp_name=job.comp_name,
+        secret=MANAGER_SECRET, action="RENDER", job_id=job.id, comp_name=job.comp_name,
         project_path=job.project_path, output_path=job.output_path,
         start_frame=sf, end_frame=ef, rq_index=job.rq_index,
     )).encode()
@@ -765,7 +770,7 @@ def stop_slave_render(host: str, port: int = SLAVE_PORT,
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(4); s.connect((target, port))
-            s.sendall(json.dumps({"action": "STOP"}).encode()); s.close()
+            s.sendall(json.dumps({"secret": MANAGER_SECRET, "action": "STOP"}).encode()); s.close()
             return  # sent successfully
         except: pass
 
