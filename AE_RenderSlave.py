@@ -56,6 +56,7 @@ PLUGIN_DIRS_MAC = [
     "/Library/Application Support/Adobe/Plug-ins/7.0",
 ]
 AE_PLUGIN_EXTS = {".aex", ".plugin", ".flt", ".8bf"}
+AE_PLUGIN_EXTS_TUPLE = tuple(AE_PLUGIN_EXTS)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LOGGING
@@ -146,9 +147,11 @@ def scan_installed_plugins() -> list:
         try:
             for root, _, files in os.walk(d):
                 for fn in files:
-                    ext = os.path.splitext(fn)[1].lower()
-                    if ext in AE_PLUGIN_EXTS:
-                        found.add(os.path.splitext(fn)[0].lower())
+                    fn_lower = fn.lower()
+                    if fn_lower.endswith(AE_PLUGIN_EXTS_TUPLE):
+                        name, ext = os.path.splitext(fn_lower)
+                        if ext in AE_PLUGIN_EXTS:
+                            found.add(name)
         except Exception as e:
             log.debug(f"Plugin scan error in {d}: {e}")
     return list(found)
