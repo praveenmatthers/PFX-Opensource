@@ -14,6 +14,7 @@ Run: python AE_RenderManager.py
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Network ───────────────────────────────────────────────────────────────────
+MANAGER_HOST  = "0.0.0.0"       # IP the manager listens on (default 0.0.0.0 for all interfaces)
 MANAGER_PORT  = 9876        # Port the manager listens on (HTTP + slave TCP)
 SLAVE_PORT    = 9877        # Port each slave listens on for job dispatch
 
@@ -488,8 +489,9 @@ class HTTPServerThread(QThread):
     http_job     = pyqtSignal(dict)   # new render job received
     slave_update = pyqtSignal(dict)   # slave heartbeat / status received
 
-    def __init__(self, port=MANAGER_PORT):
+    def __init__(self, host=MANAGER_HOST, port=MANAGER_PORT):
         super().__init__()
+        self.host    = host
         self.port    = port
         self._server = None
 
@@ -514,7 +516,7 @@ class HTTPServerThread(QThread):
         ManagerHTTPHandler.slave_callback = slave_cb
 
         try:
-            self._server = ThreadingHTTPServer(("0.0.0.0", self.port), ManagerHTTPHandler)
+            self._server = ThreadingHTTPServer((self.host, self.port), ManagerHTTPHandler)
             log.info(f"HTTP server listening on port {self.port} "
                      f"(jobs + slave heartbeats)")
             self._server.serve_forever()
@@ -1357,7 +1359,7 @@ class AERenderManager(QMainWindow):
         self.watcher.new_job.connect(self._on_new_job)
         self.watcher.start()
 
-        self.http_thread = HTTPServerThread(MANAGER_PORT)
+        self.http_thread = HTTPServerThread(MANAGER_HOST, MANAGER_PORT)
         self.http_thread.http_job.connect(self._on_new_job)
         self.http_thread.slave_update.connect(self._on_slave_update)
         self.http_thread.start()
