@@ -292,6 +292,11 @@
 
     submitBtn.onClick = function () {
         var mHost = (hostEdit.text || DEFAULT_HOST).replace(/\s/g, "");
+        if (!/^[a-zA-Z0-9.-]+$/.test(mHost)) {
+            alert("Invalid Host format. Please use a valid hostname or IP address.");
+            return;
+        }
+
         var mPort = parseInt(portEdit.text, 10) || DEFAULT_PORT;
         var prio = parseInt(prioEdit.text, 10);
         if (isNaN(prio) || prio < 0) prio = 0;
