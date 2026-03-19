@@ -32,6 +32,9 @@ MANAGER_PORT     = 9876
 SLAVE_PORT       = 9877
 HEARTBEAT_SEC    = 5
 
+# List of allowed base directories for render output. Leave empty to allow any (not recommended).
+ALLOWED_OUTPUT_DIRS = []
+
 AERENDER_PRIMARY = r"C:\Program Files\Adobe\Adobe After Effects 2024\Support Files\aerender.exe"
 AERENDER_FALLBACK = [
     r"C:\Program Files\Adobe\Adobe After Effects 2025\Support Files\aerender.exe",
@@ -170,6 +173,28 @@ def check_plugins(required: list, installed_set: set) -> dict:
         result[eff] = matched
     return result
 
+def is_safe_output_path(path_str: str) -> bool:
+    if not path_str:
+        return True
+
+    # Block directory traversal attempts
+    if ".." in path_str:
+        return False
+
+    if not ALLOWED_OUTPUT_DIRS:
+        return True
+
+    try:
+        abs_path = os.path.abspath(path_str)
+        for allowed in ALLOWED_OUTPUT_DIRS:
+            allowed_abs = os.path.abspath(allowed)
+            # Ensure the path is exactly the allowed dir or a subdirectory
+            if abs_path == allowed_abs or abs_path.startswith(allowed_abs + os.sep):
+                return True
+        return False
+    except Exception:
+        return False
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SLAVE STATE
@@ -291,6 +316,12 @@ class SlaveState:
                      "(3) this machine has read access to the share", "ERROR")
             else:
                 clog(f"Project file not found: {project}", "ERROR")
+            self._finish(job_id, False)
+            return
+
+        # Validate output directory for security
+        if not is_safe_output_path(output):
+            clog(f"Output path validation failed (directory traversal or disallowed path): {output}", "ERROR")
             self._finish(job_id, False)
             return
 

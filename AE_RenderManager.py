@@ -47,6 +47,10 @@ MAX_RETRIES    = 3           # Auto-debug max retries per frame before marking F
 HEARTBEAT_SEC  = 5           # How often slaves send heartbeats (must match slave config)
 STALL_TIMEOUT  = 120         # Seconds without frame progress = stalled render
 
+# ── Security ──────────────────────────────────────────────────────────────────
+# List of allowed base directories for render output. Leave empty to allow any (not recommended).
+ALLOWED_OUTPUT_DIRS = []
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  END OF PRODUCTION CONFIG  —  Do not edit below unless you know what you're doing
 # ══════════════════════════════════════════════════════════════════════════════
@@ -107,6 +111,28 @@ def find_aerender():
     for p in AERENDER_FALLBACKS:
         if os.path.exists(p): return p
     return ""
+
+def is_safe_output_path(path_str: str) -> bool:
+    if not path_str:
+        return True
+
+    # Block directory traversal attempts
+    if ".." in path_str:
+        return False
+
+    if not ALLOWED_OUTPUT_DIRS:
+        return True
+
+    try:
+        abs_path = os.path.abspath(path_str)
+        for allowed in ALLOWED_OUTPUT_DIRS:
+            allowed_abs = os.path.abspath(allowed)
+            # Ensure the path is exactly the allowed dir or a subdirectory
+            if abs_path == allowed_abs or abs_path.startswith(allowed_abs + os.sep):
+                return True
+        return False
+    except Exception:
+        return False
 
 # ── Status constants ──────────────────────────────────────────────────────────
 class JS:
@@ -561,6 +587,10 @@ class RenderWorker(QThread):
 
         if not os.path.exists(job.project_path):
             self.sig_log.emit(job.id, f"[ERROR] Project not found: {job.project_path}")
+            self.sig_status.emit(job.id, JS.FAILED); return
+
+        if not is_safe_output_path(job.output_path):
+            self.sig_log.emit(job.id, f"[ERROR] Output path validation failed: {job.output_path}")
             self.sig_status.emit(job.id, JS.FAILED); return
 
         if job.output_path:
