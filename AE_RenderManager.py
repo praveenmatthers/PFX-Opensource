@@ -324,19 +324,34 @@ class RenderJob:
 # ══════════════════════════════════════════════════════════════════════════════
 MAX_HISTORY_JOBS = 200   # max completed jobs kept in history file
 
+_history_lock = threading.Lock()
+_save_thread = None
+
 def save_history(jobs: dict):
+    global _save_thread
     try:
+        # Serialize the jobs synchronously to avoid dictionary mutation errors
+        # during iteration by the background thread.
         all_jobs = [j.to_dict() for j in jobs.values()]
-        # Prune: keep ALL active/failed/stopped jobs + newest N completed
-        active  = [d for d in all_jobs if d.get("status") != "Completed"]
-        done    = [d for d in all_jobs if d.get("status") == "Completed"]
-        # Sort completed by submitted_epoch descending, keep newest
-        done.sort(key=lambda d: d.get("submitted_epoch", 0), reverse=True)
-        pruned  = active + done[:MAX_HISTORY_JOBS]
-        with open(HISTORY_FILE, "w") as f:
-            json.dump(pruned, f, indent=2)
+
+        def background_save():
+            with _history_lock:
+                try:
+                    # Prune: keep ALL active/failed/stopped jobs + newest N completed
+                    active  = [d for d in all_jobs if d.get("status") != "Completed"]
+                    done    = [d for d in all_jobs if d.get("status") == "Completed"]
+                    # Sort completed by submitted_epoch descending, keep newest
+                    done.sort(key=lambda d: d.get("submitted_epoch", 0), reverse=True)
+                    pruned  = active + done[:MAX_HISTORY_JOBS]
+                    with open(HISTORY_FILE, "w") as f:
+                        json.dump(pruned, f, indent=2)
+                except Exception as e:
+                    log.error(f"Save history background task failed: {e}")
+
+        _save_thread = threading.Thread(target=background_save, daemon=True)
+        _save_thread.start()
     except Exception as e:
-        log.error(f"Save history failed: {e}")
+        log.error(f"Save history dispatch failed: {e}")
 
 def load_history():
     if not os.path.exists(HISTORY_FILE): return []
@@ -2369,6 +2384,9 @@ class AERenderManager(QMainWindow):
     # ── CLOSE ─────────────────────────────────────────────────────────────────
     def closeEvent(self, event):
         save_history(self.jobs)
+        if _save_thread and _save_thread.is_alive():
+            _save_thread.join(timeout=5.0)
+
         for svc in (self.watcher, self.http_thread,
                     self.frame_watcher, self.auto_debug_engine):
             try: svc.stop()
