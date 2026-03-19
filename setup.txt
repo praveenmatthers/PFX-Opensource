@@ -1,0 +1,47 @@
+1. On the Manager PC (Your Main Machine)
+Run this ONE TIME as Administrator to open the network doors:
+
+powershell
+# Reset and open ports 9876 (Manager) and 9877 (Slave) on all profiles
+Remove-NetFirewallRule -DisplayName "AEREN*" -ErrorAction SilentlyContinue
+New-NetFirewallRule -DisplayName "AEREN Manager (9876)" -Direction Inbound -LocalPort 9876 -Protocol TCP -Action Allow -Profile Any
+New-NetFirewallRule -DisplayName "AEREN Slave (9877)" -Direction Inbound -LocalPort 9877 -Protocol TCP -Action Allow -Profile Any
+# Also allow the Python application itself
+$pythonPath = (Get-Command python).Source
+New-NetFirewallRule -DisplayName "AEREN Python" -Direction Inbound -Program $pythonPath -Action Allow -Profile Any
+To start the Manager:
+
+powershell
+python "e:\AI Projects\AE_RenderManager\AE_RenderManager.py"
+2. On ALL Slave PCs (The Render Nodes)
+Every PC that will participate in the render needs its own firewall rule. Run this as Administrator on each slave:
+
+powershell
+# Open port 9877 to receive commands from the Manager
+New-NetFirewallRule -DisplayName "AEREN Slave Port" -Direction Inbound -LocalPort 9877 -Protocol TCP -Action Allow -Profile Any
+To start the Slave (replace the IP with your Manager's IP):
+
+powershell
+# Replace 192.168.1.180 with YOUR constant IP
+python "UNC_OR_LOCAL_PATH\AE_RenderSlave.py" --manager 192.168.1.180 --name "SLAVE-NODE-01"
+3. The "Map Drive" Script (Important for Production)
+If you are using a network server for storage, all PCs MUST use the same drive letter (like R:). Run this on every PC to map your network folder:
+
+powershell
+# Replace \\SERVER\Projects with your real server path
+New-PSDrive -Name "R" -PSProvider FileSystem -Root "\\DESKTOP-3BK9PQH\Projects" -Persist
+Now, when you submit a job, ensure the AE project and output paths both start with R:\.
+
+4. How to Verify Everything is Set Up Correctly
+On any workstation, run this to see if you can reach the Manager:
+
+powershell
+# Replace with your manager's IP
+Test-NetConnection -ComputerName 192.168.1.180 -Port 9876
+If it says TcpTestSucceeded : True, you are 100% ready for production!
+
+Summary of IPs for tomorrow:
+Manager IP: [Your Constant IP] (e.g., 192.168.1.180)
+Manager Port: 9876
+Slave Port: 9877
+Good luck with the launch tomo
