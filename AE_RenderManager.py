@@ -1140,16 +1140,7 @@ class AERenderManager(QMainWindow):
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0); root.setSpacing(0)
 
-        self._init_banner(root)
-        self._init_menu()
-
-        self._init_toolbar(root)
-        self._init_count_bar(root)
-
-        self._init_tables(root)
-        self._init_statusbar()
-
-    def _init_banner(self, root):
+        # Banner
         banner = QFrame()
         banner.setStyleSheet(
             "QFrame { background: #000000; border-bottom: 1px solid #181818; }")
@@ -1173,7 +1164,7 @@ class AERenderManager(QMainWindow):
         bl.addStretch(); bl.addWidget(self._farm_lbl)
         root.addWidget(banner)
 
-    def _init_menu(self):
+        # Menubar  (no File/Settings — config is code-only)
         mb = self.menuBar()
 
         vm = mb.addMenu("View")
@@ -1196,7 +1187,7 @@ class AERenderManager(QMainWindow):
             f"User     : {CURRENT_USER}\n"
             f"Hostname : {LOCAL_HOSTNAME}"))
 
-    def _init_toolbar(self, root):
+        # Toolbar  (no emojis, no Delete button)
         tb = QToolBar(); tb.setMovable(False); tb.setFloatable(False)
         self.addToolBar(tb)
 
@@ -1235,7 +1226,7 @@ class AERenderManager(QMainWindow):
 
         root.addWidget(tb)
 
-    def _init_count_bar(self, root):
+        # Count bar
         self._count_bar = QLabel("  Total: 0   Rendering: 0   Pending: 0")
         self._count_bar.setStyleSheet(
             "background:#000000; color:#50586A; font-size:11px;"
@@ -1243,7 +1234,6 @@ class AERenderManager(QMainWindow):
         self._count_bar.setFixedHeight(20)
         root.addWidget(self._count_bar)
 
-    def _init_tables(self, root):
         # Main splitter
         main_spl = QSplitter(Qt.Vertical);   main_spl.setHandleWidth(2)
         top_spl  = QSplitter(Qt.Horizontal); top_spl.setHandleWidth(2)
@@ -1341,7 +1331,7 @@ class AERenderManager(QMainWindow):
         main_spl.setSizes([620, 220])
         root.addWidget(main_spl)
 
-    def _init_statusbar(self):
+        # Status bar
         sb = QStatusBar(); self.setStatusBar(sb)
         self._sb_conn  = QLabel("Listening")
         self._sb_conn.setStyleSheet("color:#228844;font-size:11px;background:transparent;")
