@@ -668,8 +668,8 @@ class RenderWorker(QThread):
 # ══════════════════════════════════════════════════════════════════════════════
 class FrameWatcher(QThread):
     frame_update = pyqtSignal(str, int)
-    IMG_EXTS = {'.png','.jpg','.jpeg','.exr','.tif','.tiff',
-                '.dpx','.hdr','.bmp','.tga','.psd','.cin'}
+    IMG_EXTS = ('.png','.jpg','.jpeg','.exr','.tif','.tiff',
+                '.dpx','.hdr','.bmp','.tga','.psd','.cin')
 
     def __init__(self):
         super().__init__()
@@ -692,7 +692,7 @@ class FrameWatcher(QThread):
                 if not out_dir or not os.path.isdir(out_dir): continue
                 try:
                     count = sum(1 for fn in os.listdir(out_dir)
-                                if os.path.splitext(fn)[1].lower() in self.IMG_EXTS)
+                                if fn.lower().endswith(self.IMG_EXTS))
                     if count > 0: self.frame_update.emit(jid, count)
                 except: pass
             time.sleep(3)
