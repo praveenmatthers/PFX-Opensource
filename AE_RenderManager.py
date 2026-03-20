@@ -13,14 +13,16 @@ Run: python AE_RenderManager.py
 #
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── Network ───────────────────────────────────────────────────────────────────
-MANAGER_PORT  = 9876        # Port the manager listens on (HTTP + slave TCP)
-SLAVE_PORT    = 9877        # Port each slave listens on for job dispatch
+# ═══════════════════════════════════════════════════════════════════════
+#  ▶  FARM ROOT  —  THE ONLY SETTING YOU NEED TO CHANGE
+#     Set this to the shared network folder everyone can access.
+#     All farm folders (jobs, queue, slaves, done, failed) live here.
+FARM_ROOT = r"\\DESKTOP-3BK9PQH\Projects\AE_RenderManager\AEREN_DATA_LOGS"
+# ═══════════════════════════════════════════════════════════════════════
 
-# ── aerender executable ───────────────────────────────────────────────────────
-# Primary path — set this to your AE version first
+
+# ── aerender executable ───────────────────────────────────────────────
 AERENDER_PATH = r"C:\Program Files\Adobe\Adobe After Effects 2024\Support Files\aerender.exe"
-# Fallback list — searched in order if primary is missing
 AERENDER_FALLBACKS = [
     r"C:\Program Files\Adobe\Adobe After Effects 2025\Support Files\aerender.exe",
     r"C:\Program Files\Adobe\Adobe After Effects 2023\Support Files\aerender.exe",
@@ -31,35 +33,30 @@ AERENDER_FALLBACKS = [
     "/Applications/Adobe After Effects 2023/aerender",
 ]
 
-# ── Job drop-file watch directory ─────────────────────────────────────────────
-# AE_Submit.jsx writes JSON files here; manager picks them up automatically.
-# Default = OS temp folder.  Override with a shared network path if needed.
-JOB_WATCH_DIR = r""          # e.g. r"\\SERVER\AEREN\jobs"  — leave "" for OS temp
+# ── Farm paths (auto-derived from FARM_ROOT — do not change) ──────────
+import os as _os
+JOB_WATCH_DIR = _os.path.join(FARM_ROOT, "jobs")   # AE_Submit writes here
+HISTORY_FILE  = _os.path.join(FARM_ROOT, "ae_render_history.json")
+FARM_QUEUE    = _os.path.join(FARM_ROOT, "queue")
+FARM_DONE     = _os.path.join(FARM_ROOT, "done")
+FARM_FAILED   = _os.path.join(FARM_ROOT, "failed")
+FARM_SLAVES   = _os.path.join(FARM_ROOT, "slaves")
+FARM_HISTORY  = _os.path.join(FARM_ROOT, "history")
 
-# ── Render history / persistence ──────────────────────────────────────────────
-# Full path to the JSON file that stores job history across restarts.
-HISTORY_FILE  = r""          # e.g. r"\\SERVER\AEREN\ae_render_history.json"
-                              # Leave "" = same folder as this script
-
-# ── Farm behaviour ────────────────────────────────────────────────────────────
-SLAVE_TIMEOUT  = 20          # Seconds of silence before a slave is marked Offline
-MAX_RETRIES    = 3           # Auto-debug max retries per frame before marking Failed
-HEARTBEAT_SEC  = 5           # How often slaves send heartbeats (must match slave config)
+# ── Farm behaviour ────────────────────────────────────────────────────
+SLAVE_TIMEOUT  = 45          # Seconds without heartbeat → slave marked Offline
+MAX_RETRIES    = 3           # Auto-debug max retries per chunk before Failed
+HEARTBEAT_SEC  = 5           # Must match slave config
 STALL_TIMEOUT  = 120         # Seconds without frame progress = stalled render
+DEFAULT_CHUNK  = 5           # Default frames per chunk when approving
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  END OF PRODUCTION CONFIG  —  Do not edit below unless you know what you're doing
+#  END OF PRODUCTION CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
 import sys, os, json, socket, threading, time, uuid, glob, platform
-import subprocess, re, logging, traceback
+import subprocess, re, logging, traceback, shutil
 from datetime import datetime
-import socketserver
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
-class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
-    """HTTPServer that handles each request in its own thread."""
-    daemon_threads = True
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -273,11 +270,13 @@ class RenderJob:
         self.assigned_workers= data.get("assigned_workers", [])
         self.submitted_epoch = data.get("submitted_epoch", time.time())
         self.priority        = int(data.get("priority",   5))
+        self.chunk_size      = int(data.get("chunk_size", DEFAULT_CHUNK))
         self.auto_debug      = bool(data.get("auto_debug", True))
         self.is_video        = bool(data.get("is_video",  False))
         self.required_effects= data.get("required_effects", [])
         self.preflight_report= data.get("preflight_report", {})
         self.frame_retries   = {int(k): int(v) for k, v in data.get("frame_retries", {}).items()}
+        self.frame_machines  = {int(k): str(v) for k, v in data.get("frame_machines", {}).items()}
         self.process         = None
         self._table_row      = -1
         self._pause_event    = threading.Event()
@@ -314,9 +313,11 @@ class RenderJob:
             user=self.source_user, errors=self.errors, hostname=self.hostname,
             frame_status={str(k): v for k, v in self.frame_status.items()},
             assigned_workers=self.assigned_workers, submitted_epoch=self.submitted_epoch,
-            priority=self.priority, auto_debug=self.auto_debug, is_video=self.is_video,
+            priority=self.priority, chunk_size=self.chunk_size,
+            auto_debug=self.auto_debug, is_video=self.is_video,
             required_effects=self.required_effects, preflight_report=self.preflight_report,
             frame_retries={str(k): v for k, v in self.frame_retries.items()},
+            frame_machines={str(k): v for k, v in self.frame_machines.items()},
         )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -346,30 +347,20 @@ def load_history():
         log.error(f"Load history failed: {e}"); return []
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PREFLIGHT — ask a slave if plugins are installed
+#  PREFLIGHT — reads installed plugins from slave heartbeat JSON on farm share
 # ══════════════════════════════════════════════════════════════════════════════
-def check_slave_plugins(slave_ip: str, slave_port: int,
-                        required: list, timeout: int = 8) -> dict:
+def check_slave_plugins_fs(hostname: str, required: list) -> dict:
+    """Read the slave's heartbeat JSON from the farm share and check plugin list."""
     if not required: return {}
-    payload = json.dumps({"action": "PREFLIGHT", "required": required}).encode()
+    slave_file = os.path.join(FARM_SLAVES, f"{hostname}.json")
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect((slave_ip, slave_port))
-        s.sendall(payload)
-        data = b""
-        while True:
-            try:
-                chunk = s.recv(65536)
-                if not chunk: break
-                data += chunk
-            except: break
-        s.close()
-        if data:
-            return json.loads(data.decode()).get("plugins", {})
+        with open(slave_file, "r", encoding="utf-8") as f:
+            info = json.load(f)
+        installed = set(info.get("plugins", []))
+        return {p: (p in installed) for p in required}
     except Exception as e:
-        log.warning(f"Preflight failed for {slave_ip}: {e}")
-    return {}
+        log.warning(f"Preflight read failed for {hostname}: {e}")
+    return {p: False for p in required}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  JOB FILE WATCHER
@@ -385,146 +376,93 @@ class JobWatcher(QThread):
     def run(self):
         while self._run:
             try:
-                for fp in glob.glob(os.path.join(JOB_WATCH_DIR, JOB_PATTERN)):
-                    if fp not in self._seen:
+                # Match both old pattern AND new-style JOB_*.json from AE_Submit.jsx
+                patterns = [
+                    os.path.join(JOB_WATCH_DIR, JOB_PATTERN),
+                    os.path.join(JOB_WATCH_DIR, "JOB_*.json"),
+                ]
+                seen_files = set()
+                for pat in patterns:
+                    for fp in glob.glob(pat):
+                        if fp in seen_files or fp in self._seen:
+                            continue
+                        seen_files.add(fp)
                         self._seen.add(fp)
                         try:
-                            with open(fp) as f: data = json.load(f)
-                            for jd in data.get("jobs", []):
-                                jd["machine"]          = data.get("machine", CURRENT_USER)
-                                jd["user"]             = data.get("user",    CURRENT_USER)
-                                jd["submitted_at"]     = data.get("submitted_at", "")
-                                jd["project_path"]     = data.get("project", jd.get("project_path", ""))
-                                jd["submitted_epoch"]  = time.time()
-                                jd["priority"]         = int(data.get("priority", 5))
-                                jd["required_effects"] = data.get("required_effects", [])
+                            with open(fp, encoding="utf-8") as f:
+                                data = json.load(f)
+                            # New-style: single job object with 'job_id' key
+                            if "job_id" in data:
+                                jd = data
+                                jd.setdefault("machine",         jd.get("submitted_from", CURRENT_USER))
+                                jd.setdefault("user",            jd.get("submitted_by",   CURRENT_USER))
+                                jd.setdefault("submitted_at",    jd.get("submitted_at",   ""))
+                                jd.setdefault("submitted_epoch", time.time())
+                                jd.setdefault("priority",        int(jd.get("priority", 5)))
+                                jd.setdefault("required_effects",jd.get("required_plugins", []))
+                                # Map fields to RenderJob expected keys
+                                jd["id"]          = jd.get("job_id", jd.get("id", ""))
+                                jd["project_path"]= jd.get("project_path", "")
                                 self.new_job.emit(jd)
-                            try: os.remove(fp)
-                            except: pass
+                            else:
+                                # Legacy: {jobs: [...], machine: ..., ...}
+                                for jd in data.get("jobs", []):
+                                    jd["machine"]         = data.get("machine",          CURRENT_USER)
+                                    jd["user"]            = data.get("user",             CURRENT_USER)
+                                    jd["submitted_at"]    = data.get("submitted_at",     "")
+                                    jd["project_path"]    = data.get("project",          jd.get("project_path", ""))
+                                    jd["submitted_epoch"] = time.time()
+                                    jd["priority"]        = int(data.get("priority",     5))
+                                    jd["required_effects"]= data.get("required_effects", [])
+                                    self.new_job.emit(jd)
+                            # Don't delete the job JSON — slave needs it too
+                            # (Manager just reads it; slave picks up chunks from queue/)
                         except Exception as e:
-                            log.error(f"Job file error: {e}")
+                            log.error(f"Job file error {fp}: {e}")
             except Exception as e:
                 log.error(f"JobWatcher error: {e}")
-            time.sleep(2)
+            time.sleep(3)
 
     def stop(self): self._run = False
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  HTTP SERVER  (receives /submit from AE_Submit.jsx curl call)
+#  SLAVE WATCHER  — polls FARM_SLAVES/*.json every 5s for heartbeats
 # ══════════════════════════════════════════════════════════════════════════════
-class ManagerHTTPHandler(BaseHTTPRequestHandler):
-    # Callbacks set by HTTPServerThread before server starts
-    job_callback    = None   # called with job dict on /submit
-    slave_callback  = None   # called with slave dict on /heartbeat or /register
+class SlaveWatcher(QThread):
+    """Reads slave heartbeat JSON files from FARM_SLAVES and emits slave_update."""
+    slave_update = pyqtSignal(dict)
 
-    def log_message(self, fmt, *args): pass  # suppress default stdout logging
-
-    def send_json(self, obj, code=200):
-        body = json.dumps(obj).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _read_json(self):
-        length = int(self.headers.get("Content-Length", 0))
-        return json.loads(self.rfile.read(length).decode())
-
-    def do_POST(self):
-        try:
-            data       = self._read_json()
-            client_ip  = self.client_address[0]
-
-            # ── Job submission from AE_Submit.jsx (curl) ──────────────────────
-            if self.path == "/submit":
-                if ManagerHTTPHandler.job_callback:
-                    ManagerHTTPHandler.job_callback(data)
-                self.send_json({"status": "ok"})
-
-            # ── Slave registration ────────────────────────────────────────────
-            elif self.path == "/register":
-                data["host"]      = client_ip
-                data["last_seen"] = time.time()
-                if not data.get("type"):
-                    data["type"] = "SLAVE_CONNECT"
-                if ManagerHTTPHandler.slave_callback:
-                    ManagerHTTPHandler.slave_callback(data)
-                self.send_json({"status": "ok"})
-
-            # ── Slave heartbeat / progress / done ─────────────────────────────
-            elif self.path == "/heartbeat":
-                data["host"]      = client_ip
-                data["last_seen"] = time.time()
-                if ManagerHTTPHandler.slave_callback:
-                    ManagerHTTPHandler.slave_callback(data)
-                self.send_json({"status": "ok"})
-
-            else:
-                self.send_json({"error": "not found"}, 404)
-
-        except Exception as e:
-            log.debug(f"HTTP handler error on {self.path}: {e}")
-            try: self.send_json({"error": str(e)}, 500)
-            except: pass
-
-    def do_GET(self):
-        if self.path == "/ping":
-            self.send_json({"status": "ok", "manager": APP_NAME,
-                            "version": MANAGER_VERSION})
-        else:
-            self.send_json({"error": "not found"}, 404)
-
-
-class HTTPServerThread(QThread):
-    """
-    Single HTTP server on MANAGER_PORT.
-    Handles:
-      POST /submit    — job from AE_Submit.jsx
-      POST /register  — slave first connection
-      POST /heartbeat — slave status / progress / done
-      GET  /ping      — health check
-    """
-    http_job     = pyqtSignal(dict)   # new render job received
-    slave_update = pyqtSignal(dict)   # slave heartbeat / status received
-
-    def __init__(self, port=MANAGER_PORT):
+    def __init__(self, slaves_ref: dict):
         super().__init__()
-        self.port    = port
-        self._server = None
+        self._slaves = slaves_ref
+        self._run    = True
 
     def run(self):
-        # Wire job callback
-        def job_cb(data):
-            for jd in data.get("jobs", []):
-                jd["machine"]          = data.get("machine", "")
-                jd["user"]             = data.get("user",    "")
-                jd["submitted_at"]     = data.get("submitted_at", "")
-                jd["project_path"]     = data.get("project", jd.get("project_path", ""))
-                jd["submitted_epoch"]  = time.time()
-                jd["priority"]         = int(data.get("priority", 5))
-                jd["required_effects"] = data.get("required_effects", [])
-                self.http_job.emit(jd)
+        while self._run:
+            try:
+                if os.path.isdir(FARM_SLAVES):
+                    for fp in glob.glob(os.path.join(FARM_SLAVES, "*.json")):
+                        # Skip STOP signal files
+                        if "_STOP" in os.path.basename(fp): continue
+                        try:
+                            with open(fp, encoding="utf-8") as f:
+                                data = json.load(f)
+                            # Inject last_seen_epoch as last_seen for timeout logic
+                            epoch = data.get("last_seen_epoch", 0)
+                            if epoch:
+                                data["last_seen"] = epoch
+                            else:
+                                data["last_seen"] = os.path.getmtime(fp)
+                            self.slave_update.emit(data)
+                        except Exception as e:
+                            log.debug(f"SlaveWatcher read error {fp}: {e}")
+            except Exception as e:
+                log.error(f"SlaveWatcher error: {e}")
+            time.sleep(5)
 
-        # Wire slave callback
-        def slave_cb(data):
-            self.slave_update.emit(data)
+    def stop(self): self._run = False
 
-        ManagerHTTPHandler.job_callback   = job_cb
-        ManagerHTTPHandler.slave_callback = slave_cb
-
-        try:
-            self._server = ThreadingHTTPServer(("0.0.0.0", self.port), ManagerHTTPHandler)
-            log.info(f"HTTP server listening on port {self.port} "
-                     f"(jobs + slave heartbeats)")
-            self._server.serve_forever()
-        except Exception as e:
-            log.error(f"HTTP server error: {e}")
-
-    def stop(self):
-        if self._server:
-            try: self._server.shutdown()
-            except: pass
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  LOCAL RENDER WORKER
@@ -700,74 +638,61 @@ class FrameWatcher(QThread):
     def stop(self): self._run = False
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SLAVE DISPATCH
+#  FILE-BASED SLAVE DISPATCH  (no ports, no sockets, no firewall needed)
 # ══════════════════════════════════════════════════════════════════════════════
-def dispatch_to_slave(host: str, job: RenderJob,
+def _jwrite_safe(path: str, data: dict) -> bool:
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        try: os.replace(tmp, path)
+        except: os.rename(tmp, path)
+        return True
+    except Exception as e:
+        try: os.remove(tmp)
+        except: pass
+        log.error(f"jwrite_safe failed {path}: {e}"); return False
+
+def dispatch_to_slave(hostname: str, job: RenderJob,
                       start_frame: int = None, end_frame: int = None,
-                      port: int = SLAVE_PORT,
-                      reported_ip: str = None) -> bool:
+                      **_kwargs) -> bool:
     """
-    Send a RENDER command to a slave over TCP.
-    Tries `host` (client_address) first, then `reported_ip` (slave's self-reported IP)
-    as a fallback for multi-NIC / NAT studio environments.
+    File-based dispatch: writes a DISPATCH JSON into the farm queue folder.
+    The slave polls this folder and picks it up automatically.
+    Always returns True (fire-and-forget; slave heartbeat confirms pickup).
     """
     sf = start_frame if start_frame is not None else job.start_frame
     ef = end_frame   if end_frame   is not None else job.end_frame
-    payload = json.dumps(dict(
-        action="RENDER", job_id=job.id, comp_name=job.comp_name,
+    os.makedirs(FARM_QUEUE, exist_ok=True)
+    chunk_id = f"chunk_{sf:04d}-{ef:04d}"
+    dispatch_path = os.path.join(FARM_QUEUE, f"JOB_{job.id}_{chunk_id}.json")
+    payload = dict(
+        job_id=job.id, chunk_id=chunk_id, comp_name=job.comp_name,
         project_path=job.project_path, output_path=job.output_path,
         start_frame=sf, end_frame=ef, rq_index=job.rq_index,
-    )).encode()
+        status="WAITING", priority=job.priority,
+        dispatched_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        eligible_slaves=[hostname] if hostname and hostname != "Any" else None,
+    )
+    ok = _jwrite_safe(dispatch_path, payload)
+    if ok:
+        log.info(f"Dispatched job {job.id} frames {sf}-{ef} -> farm queue (slave: {hostname})")
+    return ok
 
-    targets = [host]
-    if reported_ip and reported_ip != host and not reported_ip.startswith("127."):
-        targets.append(reported_ip)
-
-    for target in targets:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(6)
-            s.connect((target, port))
-            s.sendall(payload)
-            # Read slave's response to confirm it accepted (not "busy")
-            s.settimeout(4)
-            resp_data = b""
-            try:
-                while True:
-                    chunk = s.recv(1024)
-                    if not chunk: break
-                    resp_data += chunk
-                    if len(resp_data) > 512: break  # enough to parse status
-            except: pass
-            s.close()
-            if resp_data:
-                try:
-                    resp = json.loads(resp_data.decode())
-                    if resp.get("status") == "busy":
-                        log.warning(f"dispatch_to_slave {target}: slave busy, trying next")
-                        continue   # try next target
-                except: pass
-            if target != host:
-                log.info(f"dispatch_to_slave: connected via reported_ip {target} (not {host})")
-            return True
-        except Exception as e:
-            log.debug(f"dispatch_to_slave {target}:{port} failed: {e}")
-
-    log.warning(f"dispatch_to_slave: all targets failed for slave {host}")
-    return False
-
-def stop_slave_render(host: str, port: int = SLAVE_PORT,
-                      reported_ip: str = None):
-    targets = [host]
-    if reported_ip and reported_ip != host and not reported_ip.startswith("127."):
-        targets.append(reported_ip)
-    for target in targets:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(4); s.connect((target, port))
-            s.sendall(json.dumps({"action": "STOP"}).encode()); s.close()
-            return  # sent successfully
-        except: pass
+def stop_slave_render(hostname: str, **_kwargs):
+    """
+    File-based stop: writes a STOP signal JSON to the slaves folder.
+    The slave watches for this file and terminates its aerender process.
+    """
+    if not hostname or hostname in ("Local", ""):
+        return
+    os.makedirs(FARM_SLAVES, exist_ok=True)
+    stop_path = os.path.join(FARM_SLAVES, f"{hostname}_STOP.json")
+    _jwrite_safe(stop_path, {
+        "action": "STOP",
+        "sent_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    log.info(f"STOP signal written for slave: {hostname}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  AUTO DEBUG ENGINE
@@ -921,8 +846,8 @@ class AssignWorkersDialog(QDialog):
             lay.addWidget(self._lw)
 
             row = QHBoxLayout()
-            ab = QPushButton("All");  ab.setMaximumWidth(55)
-            nb = QPushButton("None"); nb.setMaximumWidth(55)
+            ab = QPushButton("Check All");  ab.setMaximumWidth(75)
+            nb = QPushButton("Check None"); nb.setMaximumWidth(75)
             ab.clicked.connect(lambda: [
                 self._lw.item(i).setCheckState(Qt.Checked)
                 for i in range(self._lw.count())])
@@ -934,19 +859,33 @@ class AssignWorkersDialog(QDialog):
 
         note = QLabel(
             "Renders run on slave machines only.  "
-            "No selection = job stays Pending until a slave is available.")
+            "If using 'SELECTED', ensure machines are online.")
         note.setStyleSheet("color:#505868; font-size:11px; background:transparent;")
         note.setWordWrap(True); lay.addWidget(note)
 
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        btns.button(QDialogButtonBox.Ok).setText("Assign & Render")
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        lay.addWidget(btns)
+        self.result_mode = "selected"
+        def _on_all():
+            self.result_mode = "all"; self.accept()
+        def _on_sel():
+            self.result_mode = "selected"; self.accept()
+
+        act_row = QHBoxLayout()
+        btn_all = QPushButton("Render on ALL (Auto)")
+        btn_all.setMinimumHeight(32)
+        btn_all.setStyleSheet("background:#285c8a; font-weight:bold;")
+        btn_sel = QPushButton("Render on SELECTED")
+        btn_sel.setMinimumHeight(32)
+        
+        btn_all.clicked.connect(_on_all)
+        btn_sel.clicked.connect(_on_sel)
+        act_row.addWidget(btn_all); act_row.addWidget(btn_sel)
+        lay.addLayout(act_row)
 
     def get_assigned_ips(self) -> list:
-        """Returns list of slave IPs that were checked."""
-        if not self._lw:
+        """Returns list of slave IPs that were checked, or empty list if ALL was selected."""
+        if getattr(self, "result_mode", "selected") == "all":
+            return []
+        if not getattr(self, "_lw", None):
             return []
         return [self._lw.item(i).data(Qt.UserRole)
                 for i in range(self._lw.count())
@@ -1029,7 +968,7 @@ class JobDetailDialog(QDialog):
         row(rf, "Status",    job.status)
         row(rf, "Progress",  f"{job.progress}%  (frame {job.current_frame})")
         row(rf, "Priority",  job.priority)
-        row(rf, "Auto-Debug",job.auto_debug)
+        row(rf, "Auto-Retries",job.auto_debug)
         row(rf, "Errors",    job.errors)
         row(rf, "Retries",   str(job.frame_retries) if job.frame_retries else "--")
         row(rf, "Submitted", job.submitted_at)
@@ -1167,23 +1106,13 @@ class AERenderManager(QMainWindow):
         # Menubar  (no File/Settings — config is code-only)
         mb = self.menuBar()
 
-        vm = mb.addMenu("View")
-        vm.addAction("Clear Completed", self._clear_done)
-
-        sm = mb.addMenu("Scripts")
-        sm.addAction("Approve All Pending",  self._approve_all_pending)
-        sm.addAction("Retry All Failed",     self._retry_failed)
-        sm.addAction("Pause All Rendering",  self._pause_all)
-        sm.addAction("Resume All Paused",    self._resume_all)
-        sm.addAction("Stop All",             self._stop_all)
-
         hm = mb.addMenu("Help")
         hm.addAction("System Info", self._show_sysinfo)
         hm.addAction("About", lambda: QMessageBox.about(
             self, f"About {APP_NAME}",
             f"{APP_NAME}  v{MANAGER_VERSION}\n\n"
             f"Distributed After Effects Render Manager\n\n"
-            f"AEREN - 2026  —  Praveen Brijwal\n\n"
+            f"2026 - Copyright Reserved - Praveen Brijwal\n\n"
             f"User     : {CURRENT_USER}\n"
             f"Hostname : {LOCAL_HOSTNAME}"))
 
@@ -1313,14 +1242,13 @@ class AERenderManager(QMainWindow):
         whl.addWidget(wh_lbl); whl.addStretch(); whl.addWidget(self._worker_total_lbl)
         wp.addWidget(wh)
 
-        self._W_COLS = ["NODE", "HOSTNAME", "STATUS", "CPU / RAM",
-                        "AE VERSION", "CURRENT JOB", "LAST SEEN"]
+        self._W_COLS = ["NODE", "HOSTNAME", "STATUS", "AE VERSION", "LAST SEEN"]
         self.worker_table = QTableWidget()
         self.worker_table.setColumnCount(len(self._W_COLS))
         self.worker_table.setHorizontalHeaderLabels(self._W_COLS)
-        for i, w in enumerate([70, 160, 86, 110, 86, 0, 72]):
+        for i, w in enumerate([70, 160, 86, 110, 72]):
             if w: self.worker_table.setColumnWidth(i, w)
-        self.worker_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
+        self.worker_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
         self.worker_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.worker_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.worker_table.setAlternatingRowColors(True)
@@ -1343,7 +1271,7 @@ class AERenderManager(QMainWindow):
         self._sb_ver.setStyleSheet("color:#303840;font-size:11px;background:transparent;")
         self._sb_user  = QLabel(f"  {CURRENT_USER}@{LOCAL_HOSTNAME}  ")
         self._sb_user.setStyleSheet("color:#3A5040;font-size:11px;background:transparent;")
-        self._sb_copy  = QLabel("  AEREN 2026 — Praveen Brijwal  ")
+        self._sb_copy  = QLabel("  2026 - Copyright Reserved - Praveen Brijwal  ")
         self._sb_copy.setStyleSheet("color:#282830;font-size:10px;background:transparent;")
         sb.addWidget(self._sb_conn); sb.addWidget(self._sb_watch)
         sb.addPermanentWidget(self._sb_up)
@@ -1353,14 +1281,19 @@ class AERenderManager(QMainWindow):
 
     # ── SERVICES ──────────────────────────────────────────────────────────────
     def _start_services(self):
+        # Ensure farm directories exist
+        for d in (JOB_WATCH_DIR, FARM_QUEUE, FARM_DONE, FARM_FAILED, FARM_SLAVES, FARM_HISTORY):
+            try: os.makedirs(d, exist_ok=True)
+            except: pass
+
         self.watcher = JobWatcher()
         self.watcher.new_job.connect(self._on_new_job)
         self.watcher.start()
 
-        self.http_thread = HTTPServerThread(MANAGER_PORT)
-        self.http_thread.http_job.connect(self._on_new_job)
-        self.http_thread.slave_update.connect(self._on_slave_update)
-        self.http_thread.start()
+        # File-based slave watcher (reads heartbeat JSONs from FARM_SLAVES)
+        self.slave_watcher = SlaveWatcher(self.slaves)
+        self.slave_watcher.slave_update.connect(self._on_slave_update)
+        self.slave_watcher.start()
 
         self.frame_watcher = FrameWatcher()
         self.frame_watcher.frame_update.connect(self._on_frame_file_update)
@@ -1397,6 +1330,9 @@ class AERenderManager(QMainWindow):
 
     # ── INCOMING SIGNALS ──────────────────────────────────────────────────────
     def _on_new_job(self, data: dict):
+        jid = data.get("id", data.get("job_id", ""))
+        if jid in self.jobs:
+            return  # Ignore duplicate submissions or re-reads
         job = RenderJob(data)
         self.jobs[job.id] = job
         self._insert_job_row_top(job)
@@ -1404,17 +1340,11 @@ class AERenderManager(QMainWindow):
         save_history(self.jobs)
 
     def _on_slave_update(self, msg: dict):
-        # "host" = client_address[0] set by HTTP handler (the IP the request arrived from)
-        host = msg.get("host", "")
+        # File-based: keyed by hostname (not IP)
+        host = msg.get("hostname", "")
         if not host: return
-        msg["last_seen"] = time.time()
-        # Also store slave's self-reported IP for multi-NIC / NAT environments.
-        # We keep the dict keyed by client_address (most reliable for inbound connections)
-        # but record reported_ip so dispatch can try it as a fallback.
-        reported_ip = msg.get("ip", "")
-        if reported_ip and not reported_ip.startswith("127."):
-            msg["reported_ip"] = reported_ip
-        # Merge with existing so we don't lose fields sent only on /register
+        if "last_seen" not in msg:
+            msg["last_seen"] = time.time()
         existing = self.slaves.get(host, {})
         existing.update(msg)
         self.slaves[host] = existing
@@ -1423,6 +1353,14 @@ class AERenderManager(QMainWindow):
         msg_type = msg.get("type",   "")
         if job_id and job_id in self.jobs:
             job = self.jobs[job_id]
+            ch = msg.get("current_chunk", "")
+            if ch and "chunk_" in ch:
+                try:
+                    pts = ch.split("_")[1].split("-")
+                    for f in range(int(pts[0]), int(pts[1]) + 1):
+                        job.frame_machines[f] = self._ip_to_hostname(host)
+                except: pass
+                
             if msg_type == "JOB_DONE":
                 job.status = JS.COMPLETED; job.progress = 100
                 job.finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1450,7 +1388,7 @@ class AERenderManager(QMainWindow):
                     retries = job.frame_retries.get(job.current_frame, 0)
                     if retries >= MAX_RETRIES:
                         self._add_log(job,
-                            f"[AUTO-DEBUG] MAX_RETRIES={MAX_RETRIES} reached — marking FAILED")
+                            f"[AUTO-RETRY] MAX_RETRIES={MAX_RETRIES} reached — marking FAILED")
                         job.status = JS.FAILED
                         self._update_job_row(job); self._update_counts()
                     else:
@@ -1465,14 +1403,14 @@ class AERenderManager(QMainWindow):
                             None)
                         if alt:
                             self._add_log(job,
-                                f"[AUTO-DEBUG] Retry {retries+1}/{MAX_RETRIES} "
+                                f"[AUTO-RETRY] Retry {retries+1}/{MAX_RETRIES} "
                                 f"-> {self._ip_to_hostname(alt)}")
                             info2 = self.slaves.get(alt, {})
                             self._on_auto_retry(job.id, job.current_frame,
                                                 job.end_frame, alt)
                         else:
                             self._add_log(job,
-                                "[AUTO-DEBUG] No idle slaves — marking FAILED")
+                                "[AUTO-RETRY] No idle slaves — marking FAILED")
                             job.status = JS.FAILED
                             self._update_job_row(job); self._update_counts()
                 else:
@@ -1485,6 +1423,7 @@ class AERenderManager(QMainWindow):
                 pct   = int(msg.get("progress",      job.progress))
                 job.current_frame = frame; job.progress = pct
                 job.frame_status[frame] = JS.COMPLETED
+                job.frame_machines[frame] = self._ip_to_hostname(host)
                 self._update_progress_bar(job)
                 self.auto_debug_engine.update_progress(job_id, frame)
                 self._dirty = True
@@ -1532,6 +1471,18 @@ class AERenderManager(QMainWindow):
             self._do_render_job(job, job.assigned_workers or [newly_idle_ip])
             return  # dispatch one job per idle event; next idle event handles next job
 
+    def _check_job_completion(self, job: RenderJob):
+        if job.status in DONE_STATUSES: return
+        done_count = sum(1 for v in job.frame_status.values() if v == JS.COMPLETED)
+        if job.progress == 100 or (job.total_frames > 0 and done_count == job.total_frames):
+            job.status = JS.COMPLETED
+            job.progress = 100
+            job.finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self._add_log(job, "[MANAGER] All frames rendered — marking COMPLETED.")
+            self.frame_watcher.unregister(job.id)
+            self._update_job_row(job); self._update_counts()
+            save_history(self.jobs)
+
     def _on_frame_file_update(self, jid: str, count: int):
         job = self.jobs.get(jid)
         if not job or job.status not in (JS.RENDERING, JS.PAUSED): return
@@ -1544,6 +1495,7 @@ class AERenderManager(QMainWindow):
             job.current_frame = min(last, job.end_frame)
             job.progress = pct
             self._update_progress_bar(job)
+        self._check_job_completion(job)
         if self._sel_jid == jid: self._dirty = True
 
     def _on_progress(self, jid: str, frame: int, pct: int):
@@ -1553,6 +1505,7 @@ class AERenderManager(QMainWindow):
         job.frame_status[frame] = JS.COMPLETED
         self._update_progress_bar(job)
         self.auto_debug_engine.update_progress(jid, frame)
+        self._check_job_completion(job)
         if self._sel_jid == jid: self._dirty = True
 
     def _on_status(self, jid: str, status: str):
@@ -1682,14 +1635,29 @@ class AERenderManager(QMainWindow):
         self._update_render_btn_state()
 
     # ── TASKS PANE ────────────────────────────────────────────────────────────
+    def _get_frame_hosts(self, job: RenderJob) -> dict:
+        fh = job.frame_machines.copy()
+        for ip, info in self.slaves.items():
+            if info.get("current_job") == job.id:
+                hn = info.get("hostname", ip)
+                try:
+                    ch = info.get("current_chunk", "")
+                    if "chunk_" in ch:
+                        pts = ch.split("_")[1].split("-")
+                        for f in range(int(pts[0]), int(pts[1]) + 1):
+                            fh[f] = hn
+                except: pass
+        return fh
+
     def _rebuild_task_pane(self, job: RenderJob):
         total   = job.total_frames
-        machine = self._ip_to_hostname(job.assigned_to) if job.assigned_to else LOCAL_HOSTNAME
+        fh      = self._get_frame_hosts(job)
         is_done = job.status in DONE_STATUSES
         self.task_table.setUpdatesEnabled(False)
         self.task_table.setRowCount(0); self.task_table.setRowCount(total)
         for idx in range(total):
             frame = job.start_frame + idx
+            machine = fh.get(frame, job.assigned_to if (job.assigned_to and job.assigned_to != "Farm") else "--")
             st, pct, mach = self._frame_state(job, frame, machine, is_done)
             retries = job.frame_retries.get(frame, 0)
             fi = QTableWidgetItem(str(frame)); fi.setData(Qt.UserRole, frame)
@@ -1711,11 +1679,12 @@ class AERenderManager(QMainWindow):
     def _update_task_pane_live(self, job: RenderJob):
         if self.task_table.rowCount() != job.total_frames:
             self._rebuild_task_pane(job); return
-        machine = self._ip_to_hostname(job.assigned_to) if job.assigned_to else LOCAL_HOSTNAME
+        fh      = self._get_frame_hosts(job)
         is_done = job.status in DONE_STATUSES
         self.task_table.setUpdatesEnabled(False)
         for idx in range(job.total_frames):
             frame = job.start_frame + idx
+            machine = fh.get(frame, job.assigned_to if (job.assigned_to and job.assigned_to != "Farm") else "--")
             st, pct, mach = self._frame_state(job, frame, machine, is_done)
             retries = job.frame_retries.get(frame, 0)
             si = self.task_table.item(idx, 1)
@@ -1771,12 +1740,8 @@ class AERenderManager(QMainWindow):
             f2 = si.font(); f2.setBold(True); si.setFont(f2)
             self.worker_table.setItem(i, 2, si)
             self.worker_table.setItem(i, 3, QTableWidgetItem(
-                f"{info.get('cpu_pct','?')}% / {info.get('ram_gb','?')}GB"))
-            self.worker_table.setItem(i, 4, QTableWidgetItem(
                 info.get("ae_version", "--")[:14]))
-            self.worker_table.setItem(i, 5, QTableWidgetItem(
-                info.get("current_job", "--")))
-            self.worker_table.setItem(i, 6, QTableWidgetItem(age))
+            self.worker_table.setItem(i, 4, QTableWidgetItem(age))
             self.worker_table.setRowHeight(i, 24)
             if alive:
                 online += 1
@@ -1786,8 +1751,7 @@ class AERenderManager(QMainWindow):
                 except: pass
         self.worker_table.setUpdatesEnabled(True)
         self._worker_total_lbl.setText(
-            f"Online: {online}/{len(self.slaves)}   "
-            f"CPU: {total_cores} Cores   RAM: {total_ram:.0f} GB")
+            f"Online: {online}/{len(self.slaves)}")
 
     # ── TICK ──────────────────────────────────────────────────────────────────
     def _tick(self):
@@ -1929,10 +1893,8 @@ class AERenderManager(QMainWindow):
         QApplication.processEvents()
 
         missing_machines = []
-        for ip in slave_ips:
-            info     = self.slaves.get(ip, {})
-            result   = check_slave_plugins(ip, info.get("port", SLAVE_PORT), effects_list)
-            hostname = info.get("hostname", ip)
+        for hostname in slave_ips:
+            result   = check_slave_plugins_fs(hostname, effects_list)
             report[hostname] = result
             if any(not ok for ok in result.values()):
                 missing_machines.append(hostname)
@@ -1968,77 +1930,128 @@ class AERenderManager(QMainWindow):
             dlg = AssignWorkersDialog(job, self.slaves, self)
             if dlg.exec_() != QDialog.Accepted: continue
             assigned_ips = dlg.get_assigned_ips()
-            if not assigned_ips:
+            if getattr(dlg, "result_mode", "selected") == "selected" and not assigned_ips:
                 QMessageBox.information(self, "No Slaves Selected",
                     "No slave machines were selected.\n"
-                    "Start AE_RenderSlave.py on a render machine first."); continue
+                    "Start or select a render machine first."); continue
             job.assigned_workers = assigned_ips
             if not self._run_preflight_for_job(job): continue
             self._do_render_job(job, assigned_ips)
 
-    def _do_render_job(self, job: RenderJob, assigned_ips: list):
+    def _do_render_job(self, job: RenderJob, assigned_ips: list, resume=False):
         """
-        Dispatch job to the first available slave in assigned_ips.
-        Slaves only — no local rendering path.
-        If a job is already rendering on a slave and workers are reassigned,
-        the current slave is stopped and the job re-dispatched to the new target.
+        Splits the job into chunks and writes every chunk to the farm queue.
+        If assigned_ips is populated, the chunks are restricted to the
+        target hostnames. Otherwise, open to ALL slaves.
         """
-        # Stop any existing render if reassigning a live job
-        existing_worker = self.workers.pop(job.id, None)
-        if existing_worker:
-            try: existing_worker.stop()
-            except: pass
-        if job.assigned_to and job.assigned_to != "Local":
-            stop_slave_render(job.assigned_to)
+        # Convert explicit IPs to list of hostnames for chunk claims
+        eligible_hosts = None
+        if assigned_ips:
+            eligible_hosts = [self.slaves.get(ip, {}).get("hostname", ip) for ip in assigned_ips]
+        
+        # We always halt prior farm activity to avoid split-brain
+        self._halt_farm_job(job)
 
         if job.output_path:
             self.frame_watcher.register(job.id, job.output_path,
                                         job.start_frame, job.end_frame)
 
-        # If no specific slaves assigned, use all currently idle slaves
+        # Verify at least one slave is alive if we want to run now
         now = time.time()
-        if not assigned_ips:
-            assigned_ips = [
-                h for h, info in self.slaves.items()
-                if (now - info.get("last_seen", 0)) < SLAVE_TIMEOUT
-                and info.get("status") == "Idle"
-            ]
-            if not assigned_ips:
-                job.status = JS.PENDING
-                self._add_log(job, "No idle slaves available — job queued as Pending")
-                self._update_job_row(job); self._update_counts()
-                return
-        # Try each assigned slave in order until one accepts
-        for ip in assigned_ips:
-            info  = self.slaves.get(ip, {})
-            alive = (now - info.get("last_seen", 0)) < SLAVE_TIMEOUT
-            if not alive:
-                self._add_log(job, f"Slave {info.get('hostname', ip)} is offline, skipping")
-                continue
-            self._add_log(job, f"Dispatching to {info.get('hostname', ip)}")
-            if dispatch_to_slave(ip, job,
-                                 reported_ip=info.get("reported_ip")):
-                job.assigned_to = ip
-                job.status      = JS.RENDERING
-                self._update_job_row(job)
-                self._update_counts()
-                return
-            else:
-                self._add_log(job, f"Slave {ip} rejected dispatch, trying next")
+        alive_slaves = [
+            h for h, info in self.slaves.items()
+            if (now - info.get("last_seen", 0)) < SLAVE_TIMEOUT
+        ]
+        if not alive_slaves:
+            job.status = JS.PENDING
+            self._add_log(job, "No slaves online — job queued as Pending")
+            self._update_job_row(job); self._update_counts()
+            return
 
-        # All slaves failed
-        job.status = JS.FAILED
-        self._add_log(job, "All assigned slaves unreachable — job marked Failed")
-        self._update_job_row(job)
-        self._update_counts()
+        # Split frame range into chunks
+        sf   = job.start_frame
+        ef   = job.end_frame
+        cs   = max(1, getattr(job, "chunk_size", DEFAULT_CHUNK))
+        os.makedirs(FARM_QUEUE, exist_ok=True)
+
+        chunks_written = 0
+        frame = sf
+        while frame <= ef:
+            chunk_sf = frame
+            chunk_ef = min(frame + cs - 1, ef)
+            
+            # If resuming, check if ALL frames in this chunk are already COMPLETED
+            skip_chunk = False
+            if resume:
+                all_done = True
+                for f in range(chunk_sf, chunk_ef + 1):
+                    if job.frame_status.get(f) != JS.COMPLETED:
+                        all_done = False
+                        break
+                if all_done:
+                    skip_chunk = True
+            
+            if not skip_chunk:
+                chunk_id = f"chunk_{chunk_sf:04d}-{chunk_ef:04d}"
+                dispatch_path = os.path.join(FARM_QUEUE, f"JOB_{job.id}_{chunk_id}.json")
+                payload = dict(
+                    job_id=job.id, chunk_id=chunk_id, comp_name=job.comp_name,
+                    project_path=job.project_path, output_path=job.output_path,
+                    start_frame=chunk_sf, end_frame=chunk_ef,
+                    rq_index=job.rq_index,
+                    status="WAITING", priority=job.priority,
+                    max_retries=MAX_RETRIES,
+                    dispatched_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    eligible_slaves=eligible_hosts,
+                )
+                if _jwrite_safe(dispatch_path, payload):
+                    chunks_written += 1
+                    log.info(f"Queued chunk {chunk_id} for job {job.id} (frames {chunk_sf}-{chunk_ef})")
+            frame += cs
+
+        if chunks_written > 0:
+            job.assigned_to = "Farm"
+            job.status      = JS.RENDERING
+            self._add_log(job,
+                f"Split into {chunks_written} chunk(s) of {cs} frames — "
+                f"queued for {len(alive_slaves)} slave(s)")
+            self._update_job_row(job)
+            self._update_counts()
+        else:
+            if resume:
+                job.status = JS.COMPLETED
+                job.progress = 100
+                self._add_log(job, "All frames are already completed. Job finished.")
+            else:
+                job.status = JS.FAILED
+                self._add_log(job, "Failed to write any chunks to farm queue")
+            self._update_job_row(job)
+            self._update_counts()
+
+
+    def _halt_farm_job(self, job: RenderJob):
+        """Cleans up the farm queue and forces active slaves to stop this job's chunks."""
+        # 1. Stop actively rendering slaves for this job by hostname
+        for ip, sinfo in self.slaves.items():
+            if sinfo.get("current_job") == job.id:
+                hn = sinfo.get("hostname", ip)
+                if hn: stop_slave_render(hn)
+        # 2. Remove any waiting (unclaimed/FAILED) chunks from the queue
+        try:
+            for d in [FARM_QUEUE, os.path.join(FARM_ROOT, "FAILED")]:
+                if not os.path.isdir(d): continue
+                for f in os.listdir(d):
+                    if f.startswith(f"JOB_{job.id}_") and f.endswith(".json"):
+                        try: os.remove(os.path.join(d, f))
+                        except: pass
+        except: pass
 
     def _pause_selected(self):
         for jid in self._get_selected_job_ids():
             job = self.jobs.get(jid)
             if not job or job.status != JS.RENDERING: continue
-            if job.assigned_to:
-                stop_slave_render(job.assigned_to)
-                self._add_log(job, f"Pause sent to {self._ip_to_hostname(job.assigned_to)}")
+            self._halt_farm_job(job)
+            self._add_log(job, "Job paused across the farm.")
             job.status = JS.PAUSED; self._update_job_row(job)
         self._update_counts()
 
@@ -2047,24 +2060,17 @@ class AERenderManager(QMainWindow):
             job = self.jobs.get(jid)
             if not job: continue
             if job.status == JS.PAUSED:
-                # Re-dispatch from current frame to slave
-                if job.assigned_to:
-                    self._add_log(job, f"Resuming from frame {job.current_frame} on {self._ip_to_hostname(job.assigned_to)}")
-                    if dispatch_to_slave(job.assigned_to, job,
-                                         job.current_frame, job.end_frame):
-                        job.status = JS.RENDERING; self._update_job_row(job)
-                    else:
-                        self._add_log(job, "Resume dispatch failed — slave unreachable")
-                else:
-                    self._add_log(job, "No slave assigned — use Render to reassign")
+                self._add_log(job, f"Resuming incomplete chunks...")
+                self._do_render_job(job, job.assigned_workers, resume=True)
             elif job.status in (JS.PENDING, JS.FAILED, JS.STOPPED):
                 dlg = AssignWorkersDialog(job, self.slaves, self)
                 if dlg.exec_() == QDialog.Accepted:
                     assigned_ips = dlg.get_assigned_ips()
-                    if assigned_ips:
-                        job.assigned_workers = assigned_ips
-                        if self._run_preflight_for_job(job):
-                            self._do_render_job(job, assigned_ips)
+                    if getattr(dlg, "result_mode", "selected") == "selected" and not assigned_ips:
+                        continue
+                    job.assigned_workers = assigned_ips
+                    if self._run_preflight_for_job(job):
+                        self._do_render_job(job, assigned_ips, resume=True)
         self._update_counts()
 
     def _stop_selected(self):
@@ -2080,12 +2086,7 @@ class AERenderManager(QMainWindow):
         for jid in ids:
             job = self.jobs.get(jid)
             if not job: continue
-            w = self.workers.pop(jid, None)
-            if w:
-                try: w.stop()
-                except: pass
-            if job.assigned_to and job.assigned_to != "Local":
-                stop_slave_render(job.assigned_to)
+            self._halt_farm_job(job)
             self.frame_watcher.unregister(jid)
             job.status = JS.STOPPED
             self._add_log(job, "Job stopped by user.")
@@ -2102,16 +2103,10 @@ class AERenderManager(QMainWindow):
                 f"Stop all {len(active)} active render(s)?",
                 QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
             return
-        # Stop each active job directly without relying on table selection
         for jid in active:
             job = self.jobs.get(jid)
             if not job: continue
-            w = self.workers.pop(jid, None)
-            if w:
-                try: w.stop()
-                except: pass
-            if job.assigned_to and job.assigned_to != "Local":
-                stop_slave_render(job.assigned_to)
+            self._halt_farm_job(job)
             self.frame_watcher.unregister(jid)
             job.status = JS.STOPPED
             self._add_log(job, "Job stopped by Stop All.")
@@ -2218,10 +2213,9 @@ class AERenderManager(QMainWindow):
             for e in job.required_effects
         ]
         report = {}
-        for ip in slave_ips:
-            info = self.slaves.get(ip, {})
-            result = check_slave_plugins(ip, info.get("port", SLAVE_PORT), effects_list)
-            report[info.get("hostname", ip)] = result
+        for hostname in slave_ips:
+            result = check_slave_plugins_fs(hostname, effects_list)
+            report[hostname] = result
         job.preflight_report = report
         PreflightReportDialog(job, report, self).exec_()
 
@@ -2234,10 +2228,9 @@ class AERenderManager(QMainWindow):
             job = self.jobs.get(ids[0])
             if job:
                 menu.addAction(
-                    f"Auto-Debug: {'ON  [click to disable]' if job.auto_debug else 'OFF  [click to enable]'}",
+                    f"Auto-Retries: {'ON  [click to disable]' if job.auto_debug else 'OFF  [click to enable]'}",
                     lambda: self._toggle_auto_debug(job.id, not job.auto_debug))
                 menu.addSeparator()
-        menu.addAction("Render Selected",   self._render_selected)
         menu.addAction("Pause",             self._pause_selected)
         menu.addAction("Resume",            self._resume_selected)
         menu.addAction("Retry Failed",      self._retry_failed)
@@ -2343,21 +2336,19 @@ class AERenderManager(QMainWindow):
                 JobDetailDialog(job, self).exec_()
 
     def _show_sysinfo(self):
-        try: lip = socket.gethostbyname(LOCAL_HOSTNAME)
-        except: lip = "unavailable"
         info = (
             f"Application  : {APP_NAME}  v{MANAGER_VERSION}\n"
             f"Hostname     : {LOCAL_HOSTNAME}\n"
-            f"IP           : {lip}\n"
             f"OS           : {platform.system()} {platform.release()}\n"
             f"Python       : {sys.version}\n"
-            f"Manager Port : {MANAGER_PORT}\n"
-            f"Slave Port   : {SLAVE_PORT}\n"
-            f"Watch Dir    : {JOB_WATCH_DIR}\n"
+            f"Farm Root    : {FARM_ROOT}\n"
+            f"Jobs Dir     : {JOB_WATCH_DIR}\n"
+            f"Queue Dir    : {FARM_QUEUE}\n"
+            f"Slaves Dir   : {FARM_SLAVES}\n"
             f"aerender     : {self.aerender}\n"
             f"History File : {HISTORY_FILE}\n"
             f"Current User : {CURRENT_USER}\n\n"
-            f"AEREN 2026 — Praveen Brijwal"
+            f"2026 - Copyright Reserved - Praveen Brijwal"
         )
         dlg = QDialog(self); dlg.setWindowTitle(f"{APP_NAME} — System Info")
         dlg.setMinimumSize(560, 340); dlg.setStyleSheet(SS)
@@ -2369,11 +2360,11 @@ class AERenderManager(QMainWindow):
     # ── CLOSE ─────────────────────────────────────────────────────────────────
     def closeEvent(self, event):
         save_history(self.jobs)
-        for svc in (self.watcher, self.http_thread,
+        for svc in (self.watcher, self.slave_watcher,
                     self.frame_watcher, self.auto_debug_engine):
             try: svc.stop()
             except: pass
-        # Send stop to all actively rendering slaves
+        # Send file-based stop to all actively rendering slaves
         for job in self.jobs.values():
             if job.status in ACTIVE_STATUSES and job.assigned_to:
                 try: stop_slave_render(job.assigned_to)

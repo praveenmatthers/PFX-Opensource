@@ -1,718 +1,486 @@
 #!/usr/bin/env python3
 """
-AE_RenderSlave.py  —  AEREN Render Farm Slave
-Version : 3.0.0  |  AEREN - 2026  |  Praveen Brijwal
+AE_RenderSlave.py  —  AEREN Render Farm Slave  v5.0.0
+=======================================================
+File-based render node.  Zero ports.  Zero firewall.  Zero IT dept.
+All communication via JSON files on a shared network folder.
 
-Usage:
-    python AE_RenderSlave.py --manager <MANAGER_IP> [--name NODENAME] [--port PORT]
-
-The slave:
-  • Registers with the manager on startup and sends heartbeats
-  • Listens for RENDER / STOP / PING / PREFLIGHT / STATUS commands
-  • Streams aerender progress back to the manager in real-time
-  • Handles graceful shutdown on SIGINT / SIGTERM
+CONFIGURE:  Set FARM_ROOT below.
+RUN:        python AE_RenderSlave.py
+            python AE_RenderSlave.py --name "MY-NODE-01"
 """
 
-import sys, os, json, socket, threading, time, subprocess
-import platform, argparse, signal, re, logging, traceback
+# ═══════════════════════════════════════════════════════════════════════
+#  ▶  ONLY SETTING YOU NEED TO CHANGE
+FARM_ROOT = r"\\DESKTOP-3BK9PQH\Projects\AE_RenderManager\AEREN_DATA_LOGS"
+# ═══════════════════════════════════════════════════════════════════════
+
+SLAVE_VERSION  = "5.0.0"
+POLL_SEC       = 3       # seconds between queue scans (when idle)
+HB_SEC         = 5       # heartbeat write interval
+SLAVE_TIMEOUT  = 45      # seconds without heartbeat → slave declared offline
+NET_RETRY_SEC  = 10      # pause when network share is unreachable
+
+import os, sys, json, socket, time, shutil, threading, subprocess
+import re, traceback, platform, argparse, signal
 from datetime import datetime
+from pathlib  import Path
 
-# ── Optional psutil ───────────────────────────────────────────────────────────
-try:
-    import psutil
-    HAS_PSUTIL = True
-except ImportError:
-    HAS_PSUTIL = False
+# ── ANSI Colors ───────────────────────────────────────────────────────────────
+os.system("")  # enable ANSI on Windows CMD
+R="\033[91m"; G="\033[92m"; Y="\033[93m"; C="\033[96m"
+W="\033[97m";  DG="\033[90m"; RESET="\033[0m"
+TS = lambda: datetime.now().strftime("%H:%M:%S")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CONFIG
-# ══════════════════════════════════════════════════════════════════════════════
-SLAVE_VERSION    = "3.0.0"
-MANAGER_PORT     = 9876
-SLAVE_PORT       = 9877
-HEARTBEAT_SEC    = 5
+def clog(msg, tag="INFO"):
+    col = {"OK":G,"INFO":C,"RENDER":Y,"WARN":Y,"ERROR":R,"STATUS":W}.get(tag, W)
+    print(f"{DG}[{TS()}]{RESET} {col}[{tag}]{RESET} {msg}")
+    sys.stdout.flush()
 
-AERENDER_PRIMARY = r"C:\Program Files\Adobe\Adobe After Effects 2024\Support Files\aerender.exe"
-AERENDER_FALLBACK = [
-    r"C:\Program Files\Adobe\Adobe After Effects 2025\Support Files\aerender.exe",
-    r"C:\Program Files\Adobe\Adobe After Effects 2023\Support Files\aerender.exe",
-    r"C:\Program Files\Adobe\Adobe After Effects 2022\Support Files\aerender.exe",
-    r"C:\Program Files\Adobe\Adobe After Effects 2021\Support Files\aerender.exe",
-    "/Applications/Adobe After Effects 2025/aerender",
-    "/Applications/Adobe After Effects 2024/aerender",
-    "/Applications/Adobe After Effects 2023/aerender",
-    "/Applications/Adobe After Effects 2021/aerender",
-]
+# ── Path helpers ──────────────────────────────────────────────────────────────
+def mk_paths(root):
+    r = Path(root)
+    d = {k: r/k for k in ("jobs","queue","done","failed","slaves","history")}
+    d["root"] = r
+    return d
 
-PLUGIN_DIRS_WINDOWS = [
-    r"C:\Program Files\Adobe\Adobe After Effects 2025\Support Files\Plug-ins",
-    r"C:\Program Files\Adobe\Adobe After Effects 2024\Support Files\Plug-ins",
-    r"C:\Program Files\Adobe\Adobe After Effects 2023\Support Files\Plug-ins",
-    r"C:\Program Files\Common Files\Adobe\Plug-ins\7.0",
-]
-PLUGIN_DIRS_MAC = [
-    "/Applications/Adobe After Effects 2024/Plug-ins",
-    "/Applications/Adobe After Effects 2023/Plug-ins",
-    "/Library/Application Support/Adobe/Plug-ins/7.0",
-]
-AE_PLUGIN_EXTS = {".aex", ".plugin", ".flt", ".8bf"}
+def jread(path, default=None):
+    try:
+        with open(str(path), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
 
-# ══════════════════════════════════════════════════════════════════════════════
-# LOGGING
-# ══════════════════════════════════════════════════════════════════════════════
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)-8s] %(message)s",
-    datefmt="%H:%M:%S"
-)
-log = logging.getLogger("AERenderSlave")
+def jwrite(path, data):
+    """Atomic JSON write via temp-file rename."""
+    tmp = str(path) + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        try:
+            os.replace(tmp, str(path))
+        except Exception:
+            os.rename(tmp, str(path))
+        return True
+    except Exception as e:
+        try: os.remove(tmp)
+        except: pass
+        clog(f"jwrite failed: {e}", "WARN")
+        return False
 
-ANSI = {
-    "INFO":   "\033[96m",
-    "OK":     "\033[92m",
-    "WARN":   "\033[93m",
-    "ERROR":  "\033[91m",
-    "RENDER": "\033[95m",
-    "STATUS": "\033[94m",
-    "RESET":  "\033[0m",
-}
+def mkdir_p(path):
+    try: Path(path).mkdir(parents=True, exist_ok=True)
+    except Exception as e: clog(f"mkdir_p failed: {e}", "WARN")
 
-def ts():
-    return datetime.now().strftime("%H:%M:%S")
+def safe_mv(src, dst):
+    try: shutil.move(str(src), str(dst))
+    except Exception as e: clog(f"Move failed {src}→{dst}: {e}", "WARN")
 
-def clog(msg: str, tag: str = "INFO"):
-    c = ANSI.get(tag, ANSI["RESET"])
-    print(f"{c}[{ts()}][{tag:6s}]{ANSI['RESET']} {msg}", flush=True)
+# ── System detection ──────────────────────────────────────────────────────────
+def find_aerender():
+    for year in range(2030, 2018, -1):
+        for suffix in ["", " (Beta)", " 2"]:
+            p = Path(rf"C:\Program Files\Adobe\Adobe After Effects {year}{suffix}\Support Files\aerender.exe")
+            if p.exists():
+                return str(p), str(year)
+    return None, None
 
+def detect_plugins():
+    for year in range(2030, 2018, -1):
+        base = Path(rf"C:\Program Files\Adobe\Adobe After Effects {year}\Support Files\Plug-ins")
+        if base.exists():
+            return [f.stem for f in base.rglob("*.aex")]
+    return []
 
-# ══════════════════════════════════════════════════════════════════════════════
-# HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
-def find_aerender() -> str:
-    if os.path.exists(AERENDER_PRIMARY):
-        return AERENDER_PRIMARY
-    for p in AERENDER_FALLBACK:
-        if os.path.exists(p):
-            return p
-    return ""
-
-def get_local_ip(manager_ip: str = None) -> str:
+def get_ip():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except:
-        return "127.0.0.1"
+        ip = s.getsockname()[0]; s.close(); return ip
+    except: return "127.0.0.1"
 
-def get_ae_version(aerender: str) -> str:
-    m = re.search(r"After Effects (\d{4})", aerender, re.IGNORECASE)
-    if m: return m.group(1)
-    return "Unknown"
+def sys_stats():
+    try:
+        import psutil
+        cpu = psutil.cpu_percent(interval=None)
+        vm  = psutil.virtual_memory()
+        return cpu, round(vm.used/1e9, 1), round(vm.total/1e9, 1)
+    except: return 0.0, 0.0, 0.0
 
-def cpu_pct() -> float:
-    if HAS_PSUTIL:
-        try: return round(psutil.cpu_percent(interval=None), 1)
-        except: pass
-    return 0.0
+def check_network(paths):
+    """Return True if the farm root is accessible."""
+    return paths["slaves"].parent.exists()
 
-def ram_used_gb() -> float:
-    if HAS_PSUTIL:
-        try: return round(psutil.virtual_memory().used / 1e9, 1)
-        except: pass
-    return 0.0
+# ── RenderSlave ───────────────────────────────────────────────────────────────
+class RenderSlave:
+    def __init__(self, hostname, farm_root):
+        self.hostname  = hostname
+        self.ip        = get_ip()
+        self.paths     = mk_paths(farm_root)
+        self.aerender, self.ae_ver = find_aerender()
+        self.plugins   = detect_plugins()
+        self.os_str    = f"{platform.system()} {platform.release()}"
 
-def cpu_cores() -> int:
-    if HAS_PSUTIL:
-        try: return psutil.cpu_count(logical=True) or 0
-        except: pass
-    return 0
-
-def ram_total_gb() -> float:
-    if HAS_PSUTIL:
-        try: return round(psutil.virtual_memory().total / 1e9, 1)
-        except: pass
-    return 0.0
-
-def scan_installed_plugins() -> list:
-    """
-    Scan known AE plugin directories and return a set of lowercase plugin basenames.
-    """
-    dirs = PLUGIN_DIRS_WINDOWS if platform.system() == "Windows" else PLUGIN_DIRS_MAC
-    found = set()
-    for d in dirs:
-        if not os.path.isdir(d): continue
-        try:
-            for root, _, files in os.walk(d):
-                for fn in files:
-                    ext = os.path.splitext(fn)[1].lower()
-                    if ext in AE_PLUGIN_EXTS:
-                        found.add(os.path.splitext(fn)[0].lower())
-        except Exception as e:
-            log.debug(f"Plugin scan error in {d}: {e}")
-    return list(found)
-
-def check_plugins(required: list, installed_set: set) -> dict:
-    """
-    Heuristically match required effect matchNames against installed plugin filenames.
-    Built-in ADBE effects are always present.
-    """
-    result = {}
-    for eff in required:
-        name = eff.lower() if isinstance(eff, str) else ""
-        if name.startswith("adbe "):
-            # Built-in After Effects effect — always available
-            result[eff] = True
-            continue
-        # Substring match
-        matched = any(name in plug or plug in name for plug in installed_set)
-        result[eff] = matched
-    return result
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SLAVE STATE
-# ══════════════════════════════════════════════════════════════════════════════
-class SlaveState:
-    def __init__(self, manager_ip: str, name: str, port: int):
-        self.manager_ip        = manager_ip
-        self.listen_port       = port
-        self.hostname          = name or socket.gethostname()
-        self.local_ip          = get_local_ip(manager_ip)  # use manager route to pick correct NIC
-        self.os_info           = f"{platform.system()} {platform.release()}"
-        self.aerender          = find_aerender()
-        self.ae_version        = get_ae_version(self.aerender) if self.aerender else "N/A"
-        self.installed_plugins = set(scan_installed_plugins())
-
-        self._lock              = threading.Lock()
-        self.status             = "Idle"
-        self.current_job_id     = None
-        self.current_job_name   = ""
-        self.current_frame      = 0
-        self.progress           = 0
-        self._proc              = None
-        self._global_stop       = False   # set True on SIGINT/SIGTERM
-        self._render_stop       = False   # set True per STOP command
-
-    # ── Status payload ────────────────────────────────────────────────────────
-    def _build_payload(self, extra: dict = None) -> dict:
-        with self._lock:
-            p = dict(
-                type          = "SLAVE_STATUS",
-                hostname      = self.hostname,
-                ip            = self.local_ip,
-                port          = self.listen_port,
-                os            = self.os_info,
-                status        = self.status,
-                current_job   = self.current_job_id   or "--",
-                job_name      = self.current_job_name or "--",
-                current_frame = self.current_frame,
-                progress      = self.progress,
-                aerender_ok   = bool(self.aerender),
-                ae_version    = self.ae_version,
-                cpu_pct       = cpu_pct(),
-                ram_gb        = ram_used_gb(),
-                cpu_cores     = cpu_cores(),
-                ram_total_gb  = ram_total_gb(),
-            )
-        if extra: p.update(extra)
-        return p
-
-    # ── Send to manager ───────────────────────────────────────────────────────
-    def send_status(self, extra: dict = None):
-        """Send heartbeat / progress update to manager via HTTP POST."""
-        payload = self._build_payload(extra)
-        # Choose endpoint: first contact uses /register, ongoing use /heartbeat
-        msg_type = payload.get("type", "")
-        endpoint = "/register" if msg_type == "SLAVE_CONNECT" else "/heartbeat"
-        url = f"http://{self.manager_ip}:{MANAGER_PORT}{endpoint}"
-        body = json.dumps(payload).encode()
-        try:
-            import urllib.request
-            req = urllib.request.Request(
-                url, data=body,
-                headers={"Content-Type": "application/json"},
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=4):
-                pass
-        except Exception as e:
-            # Only log at WARN level after repeated failures to avoid startup noise
-            self._hb_fail_count = getattr(self, "_hb_fail_count", 0) + 1
-            if self._hb_fail_count >= 3:
-                log.warning(f"Manager unreachable ({self._hb_fail_count}x): {e}")
-            else:
-                log.debug(f"Heartbeat attempt failed: {e}")
-            return
-        self._hb_fail_count = 0  # reset on success
+        self._lock           = threading.Lock()
+        self.status          = "IDLE"
+        self.cur_job         = None
+        self.cur_chunk       = None
+        self.cur_frame       = 0
+        self.pct             = 0
+        self.frames_done     = []
+        self._rthread        = None
+        self._stop           = threading.Event()   # stop current render
+        self._gstop          = threading.Event()   # global shutdown
+        self._last_frame_ts  = 0.0
+        self._proc           = None
 
     # ── Heartbeat ─────────────────────────────────────────────────────────────
-    def heartbeat_loop(self):
-        # Brief startup delay — manager HTTP server may still be binding its port.
-        # The /register call in main() already happened; these are ongoing heartbeats.
-        time.sleep(2)
-        while not self._global_stop:
-            self.send_status()
-            time.sleep(HEARTBEAT_SEC)
-
-    # ── RENDER ────────────────────────────────────────────────────────────────
-    def render_job(self, job: dict):
+    def write_hb(self, status=None):
+        if status:
+            with self._lock: self.status = status
+        cpu, ram_used, ram_tot = sys_stats()
         with self._lock:
-            if self.status == "Rendering":
-                clog("Already rendering — rejecting.", "WARN")
-                return
-            job_id   = str(job.get("job_id",       "UNKNOWN"))
-            comp     = str(job.get("comp_name",    ""))
-            project  = str(job.get("project_path", ""))
-            output   = str(job.get("output_path",  ""))
-            start_f  = int(job.get("start_frame",  0))
-            end_f    = int(job.get("end_frame",     0))
-            rq_index = int(job.get("rq_index",      1))
-            self.status           = "Rendering"
-            self.current_job_id   = job_id
-            self.current_job_name = comp
-            self.current_frame    = start_f
-            self.progress         = 0
-            self._render_stop     = False
+            data = {
+                "hostname": self.hostname,   "ip": self.ip,
+                "status": self.status,       "current_job": self.cur_job,
+                "current_chunk": self.cur_chunk, "current_frame": self.cur_frame,
+                "progress_pct": self.pct,    "frames_done": list(self.frames_done),
+                "cpu_pct": cpu,              "ram_used_gb": ram_used,
+                "ram_total_gb": ram_tot,     "ae_version": self.ae_ver or "unknown",
+                "aerender_path": self.aerender or "NOT FOUND",
+                "plugins": self.plugins,     "os": self.os_str,
+                "last_seen": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "last_seen_epoch": time.time(),
+                "slave_version": SLAVE_VERSION,
+            }
+        jwrite(self.paths["slaves"] / f"{self.hostname}.json", data)
 
-        clog(f"Job {job_id}: {comp}  [{start_f}–{end_f}]", "RENDER")
+    # ── Stop signal from manager ──────────────────────────────────────────────
+    def check_stop_signal(self):
+        sf = self.paths["slaves"] / f"{self.hostname}_STOP.json"
+        if sf.exists():
+            data = jread(sf, {})
+            clog(f"STOP signal received  chunk={data.get('chunk')}", "WARN")
+            self._stop.set()
+            with self._lock:
+                p = getattr(self, "_proc", None)
+                if p:
+                    clog("Asynchronously killing aerender process...", "WARN")
+                    try: p.terminate()
+                    except: pass
+                    try: p.kill()
+                    except: pass
+            try: sf.unlink()
+            except: pass
 
-        # Validation
-        if not self.aerender:
-            clog("aerender not found.", "ERROR")
-            self._finish(job_id, False)
-            return
-        # Check project file exists — give a helpful message for UNC/network paths
-        if not os.path.exists(project):
-            if project.startswith("\\") or project.startswith("//"):
-                clog(f"Network project path not accessible: {project}", "ERROR")
-                clog("Check: (1) network share is mounted, (2) path spelling, "
-                     "(3) this machine has read access to the share", "ERROR")
-            else:
-                clog(f"Project file not found: {project}", "ERROR")
-            self._finish(job_id, False)
-            return
+    # ── Claim a chunk (atomic) ────────────────────────────────────────────────
+    def claim_chunk(self):
+        q = self.paths["queue"]
+        if not q.exists(): return None
+        try:
+            files = [f for f in q.iterdir()
+                     if f.suffix == ".json" and ".CLAIMED_" not in f.name]
+            # Sort by priority (highest first) then by creation time
+            files.sort(key=lambda f: (-(jread(f, {}).get("priority", 5)), f.name))
+        except Exception: return None
 
-        # Create output directory
-        if output:
-            out_dir = os.path.dirname(output)
-            if out_dir:
+        for cf in files:
+            d = jread(cf)
+            if not d: continue
+            eligible = d.get("eligible_slaves")
+            if eligible and self.hostname not in eligible: continue
+
+            claimed = cf.parent / (cf.stem + f".CLAIMED_{self.hostname}.json")
+            try:
+                os.rename(str(cf), str(claimed))       # atomic on Windows
+                d.update({
+                    "status":     "RENDERING",
+                    "claimed_by": self.hostname,
+                    "claimed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                })
+                jwrite(claimed, d)
+                clog(f"Claimed  chunk={d.get('chunk_id')}  job={d.get('job_id')}", "OK")
+                return claimed, d
+            except (FileExistsError, OSError, PermissionError):
+                continue   # another slave got it first
+        return None
+
+    # ── Verify output files exist ─────────────────────────────────────────────
+    def _verify_out(self, output, sf, ef, out_type):
+        if not output or out_type == "VIDEO":
+            p = Path(output) if output else None
+            if p and not (p.exists() and p.stat().st_size > 0):
+                return ["video_output"]
+            return []
+        missing = []
+        bracket = re.search(r'\[#+\]', output)
+        if bracket:
+            pad = bracket.group().count("#")
+            for f in range(sf, ef + 1):
+                fp = re.sub(r'\[#+\]', str(f).zfill(pad), output)
                 try:
-                    os.makedirs(out_dir, exist_ok=True)
-                except Exception as e:
-                    clog(f"Could not create output dir: {e}", "WARN")
+                    if not (os.path.exists(fp) and os.path.getsize(fp) > 0):
+                        missing.append(f)
+                except: missing.append(f)
+        return missing
 
-        # Build command
-        cmd = [
-            self.aerender,
-            "-project", project,
-            "-comp",    comp,
-            "-s",       str(start_f),
-            "-e",       str(end_f),
-            "-rqindex", str(rq_index),
-        ]
-        if output:
-            cmd += ["-output", output]
+    # ── Render worker (runs in its own thread) ────────────────────────────────
+    def _render_worker(self, cpath, cd):
+        job_id   = cd["job_id"];    chunk_id = cd.get("chunk_id", "chunk_unknown")
+        sf       = cd["start_frame"]; ef = cd["end_frame"]
+        project  = cd.get("project_path","")
+        output   = cd.get("output_path","")
+        comp     = cd.get("comp_name","")
+        rqi      = int(cd.get("rq_index", 1))
+        out_type = cd.get("output_type","SEQUENCE")
+        total    = max(ef - sf + 1, 1)
 
-        clog("CMD: " + " ".join(cmd), "STATUS")
-        total = max(end_f - start_f + 1, 1)
+        with self._lock:
+            self.cur_job=job_id; self.cur_chunk=chunk_id
+            self.cur_frame=sf;   self.pct=0;  self.frames_done=[]
+            self._last_frame_ts = time.time()
+
+        clog(f"START  job={job_id}  chunk={chunk_id}  frames={sf}–{ef}", "RENDER")
+
+        success = False; err = None; log_lines = []; rendered = []
 
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True, bufsize=1
-            )
-            with self._lock:
-                self._proc = proc
+            if not self.aerender:
+                raise RuntimeError("aerender.exe not found on this machine")
+            if not os.path.exists(project):
+                unc = project.startswith("\\\\") or project.startswith("//")
+                hint = " (Is the network share mounted?)" if unc else ""
+                raise RuntimeError(f"Project not found: {project}{hint}")
+
+            # Create output dir
+            if output:
+                od = re.sub(r'\[#+\]', '0000', output)
+                mkdir_p(Path(od).parent)
+
+            cmd = [self.aerender,
+                   "-project", project, "-comp", comp,
+                   "-s", str(sf),       "-e",    str(ef),
+                   "-rqindex", str(rqi)]
+            if output: cmd += ["-output", output]
+
+            clog("CMD: " + " ".join(cmd), "STATUS")
+            self._stop.clear()
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1, creationflags=flags)
+            with self._lock: self._proc = proc
 
             for raw in iter(proc.stdout.readline, ""):
-                # Check stop flags
-                with self._lock:
-                    stop_now = self._render_stop or self._global_stop
-                if stop_now:
-                    clog("Stopping render on request.", "WARN")
-                    try: proc.terminate()
-                    except: pass
-                    self._finish(job_id, False, stopped=True)
-                    return
+                # honour stop requests
+                if self._stop.is_set() or self._gstop.is_set():
+                    err = "Stopped by signal"
+                    break
 
                 line = raw.rstrip()
                 if not line: continue
+                log_lines.append(line)
+                clog(line, "ERROR" if "error" in line.lower() else "RENDER")
 
-                tag = "ERROR" if "error" in line.lower() else "RENDER"
-                clog(line, tag)
-
-                # Parse aerender progress — multiple output formats across AE versions:
-                #   AE 2021 and older : "X of Y"
-                #   AE 2022-2024      : "PROGRESS:  X of Y" or "aerender: PROGRESS: X"
-                #   AE 2024+          : "Frame X (Y%)" or just a frame number line
-                cur = None
-                m = re.search(r'(\d+)\s+of\s+(\d+)', line, re.IGNORECASE)
-                if m:
-                    cur = int(m.group(1))
-                if cur is None:
+                # Parse aerender progress (handles AE 2019–2025 output formats)
+                fn = None
+                m = re.search(r'(\d+)\s+of\s+\d+', line, re.IGNORECASE)
+                if m: fn = int(m.group(1))
+                if fn is None:
                     m2 = re.search(r'PROGRESS[:\s]+(\d+)', line, re.IGNORECASE)
-                    if m2: cur = int(m2.group(1))
-                if cur is None:
+                    if m2: fn = int(m2.group(1))
+                if fn is None:
                     m3 = re.search(r'Frame\s+(\d+)', line, re.IGNORECASE)
                     if m3:
-                        fn_abs = int(m3.group(1))
-                        cur = fn_abs - start_f + 1
-                if cur is not None and cur > 0:
-                    pct = min(int(cur / total * 100), 100)
-                    fn  = start_f + cur - 1
+                        abs_fn = int(m3.group(1))
+                        fn = abs_fn - sf + 1 if abs_fn >= sf else None
+
+                if fn is not None and fn > 0:
+                    actual = sf + fn - 1
+                    pct    = min(int(fn / total * 100), 100)
                     with self._lock:
-                        self.current_frame = fn
-                        self.progress      = pct
-                    self.send_status({
-                        "type":          "PROGRESS",
-                        "job_id":        job_id,
-                        "current_frame": fn,
-                        "progress":      pct,
-                    })
+                        self.cur_frame = actual; self.pct = pct
+                        self._last_frame_ts = time.time()
+                        if actual not in rendered:
+                            rendered.append(actual)
+                            self.frames_done = rendered[:]
+                    cd.update({"current_frame": actual, "progress_pct": pct,
+                               "frames_done": rendered[:]})
+                    jwrite(cpath, cd)
 
             proc.wait()
-            success = (proc.returncode == 0)
-            clog(f"Job {job_id} {'COMPLETE' if success else 'FAILED'} "
-                 f"(exit {proc.returncode})",
-                 "OK" if success else "ERROR")
-            self._finish(job_id, success)
 
-        except Exception:
-            clog(f"Render exception:\n{traceback.format_exc()}", "ERROR")
-            self._finish(job_id, False)
-
-    def _finish(self, job_id: str, success: bool, stopped: bool = False):
-        msg_type = "JOB_DONE" if success else ("JOB_STOPPED" if stopped else "JOB_FAILED")
-        with self._lock:
-            self.status           = "Idle"
-            self.current_job_id   = None
-            self.current_job_name = ""
-            self.current_frame    = 0
-            self.progress         = 0
-            self._proc            = None
-        self.send_status({"type": msg_type, "job_id": job_id})
-        clog(f"{msg_type} — slave now idle.", "STATUS")
-
-    # ── Stop current render ───────────────────────────────────────────────────
-    def stop_render(self):
-        with self._lock:
-            self._render_stop = True
-            proc = self._proc
-        if proc:
-            # First try graceful termination
-            try: proc.terminate()
-            except: pass
-            # On Windows aerender sometimes ignores SIGTERM — hard kill after 3s
-            def _force_kill():
-                import time as _t
-                _t.sleep(3)
-                try:
-                    if proc.poll() is None:  # still alive
-                        proc.kill()
-                        clog("aerender force-killed after terminate timeout", "WARN")
-                except: pass
-            threading.Thread(target=_force_kill, daemon=True).start()
-
-    # ── Preflight ─────────────────────────────────────────────────────────────
-    def handle_preflight(self, required: list) -> dict:
-        clog(f"Preflight: checking {len(required)} effects", "INFO")
-        result  = check_plugins(required, self.installed_plugins)
-        missing = [k for k, v in result.items() if not v]
-        if missing:
-            clog(f"MISSING: {missing}", "WARN")
-        else:
-            clog("All plugins OK.", "OK")
-        return result
-
-    # ── Shutdown ──────────────────────────────────────────────────────────────
-    def shutdown(self):
-        self._global_stop = True
-        self.stop_render()
-        self.send_status({"type": "SLAVE_DISCONNECT"})
-        clog("Slave disconnected.", "STATUS")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TCP SERVER
-# ══════════════════════════════════════════════════════════════════════════════
-def handle_connection(conn: socket.socket, addr, slave: SlaveState):
-    data = b""
-    try:
-        conn.settimeout(5)
-        while True:
-            chunk = conn.recv(65536)
-            if not chunk: break
-            data += chunk
-    except: pass
-
-    response = None
-    if data:
-        try:
-            msg    = json.loads(data.decode())
-            action = msg.get("action", "")
-
-            if action == "RENDER":
-                clog(f"RENDER from {addr[0]}", "INFO")
-                with slave._lock:
-                    already = (slave.status == "Rendering")
-                if already:
-                    clog("Already rendering — rejecting with 'busy'", "WARN")
-                    response = json.dumps({"status": "busy",
-                                           "msg": "slave already rendering"}).encode()
+            if proc.returncode == 0 and not (self._stop.is_set() or self._gstop.is_set()):
+                missing = self._verify_out(output, sf, ef, out_type)
+                if missing:
+                    err = f"Output files missing: {missing[:10]}"
+                    cd["frames_failed"] = missing
                 else:
-                    t = threading.Thread(
-                        target=slave.render_job, args=(msg,), daemon=True)
-                    t.start()
-                    response = json.dumps({"status": "ok"}).encode()
+                    success = True
+            elif not err:
+                err = f"aerender exit code {proc.returncode}"
 
-            elif action == "STOP":
-                clog(f"STOP from {addr[0]}", "WARN")
-                slave.stop_render()
-                response = json.dumps({"status": "ok"}).encode()
-
-            elif action == "PING":
-                response = json.dumps({
-                    "status":        "ok",
-                    "hostname":      slave.hostname,
-                    "slave_status":  slave.status,
-                }).encode()
-
-            elif action == "PREFLIGHT":
-                required = msg.get("required", [])
-                result   = slave.handle_preflight(required)
-                response = json.dumps({"status": "ok", "plugins": result}).encode()
-
-            elif action == "STATUS":
-                response = json.dumps(slave._build_payload()).encode()
-
-            else:
-                clog(f"Unknown action '{action}' from {addr[0]}", "WARN")
-                response = json.dumps({"error": f"unknown action: {action}"}).encode()
-
-        except json.JSONDecodeError as e:
-            clog(f"Bad JSON from {addr[0]}: {e}", "ERROR")
-            response = json.dumps({"error": "bad JSON"}).encode()
         except Exception:
-            clog(f"Handler exception:\n{traceback.format_exc()}", "ERROR")
-            response = json.dumps({"error": "internal error"}).encode()
+            err = traceback.format_exc()
+            clog(f"Exception:\n{err}", "ERROR")
 
-    if response:
-        try: conn.sendall(response)
-        except: pass
-    try: conn.close()
-    except: pass
+        finally:
+            # Always reset state
+            with self._lock:
+                self.status=("IDLE"); self.cur_job=None; self.cur_chunk=None
+                self.cur_frame=0;     self.pct=0;        self.frames_done=[]
+                self._proc = None
 
+        # ── Finalize chunk file ────────────────────────────────────────────────
+        cd["finished_at"]  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cd["aerender_log"] = "\n".join(log_lines[-100:])
 
-def run_server(slave: SlaveState, ready_event: threading.Event = None):
-    try:
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("0.0.0.0", slave.listen_port))
-        srv.listen(10)
-        srv.settimeout(1.0)
-        clog(f"Listening on 0.0.0.0:{slave.listen_port}", "INFO")
-        if ready_event:
-            ready_event.set()   # signal that port is bound and ready
-    except Exception as e:
-        clog(f"Could not bind to port {slave.listen_port}: {e}", "ERROR")
-        if ready_event:
-            ready_event.set()   # unblock even on failure so main doesn't hang
-        sys.exit(1)
+        claimed_suffix = f".CLAIMED_{self.hostname}"
 
-    while not slave._global_stop:
+        if success:
+            cd.update({"status":"DONE","error":None,
+                       "frames_done": list(range(sf, ef+1))})
+            clog(f"DONE   job={job_id}  chunk={chunk_id}", "OK")
+            dst = self.paths["done"] / cpath.name.replace(claimed_suffix, "")
+            jwrite(cpath, cd); safe_mv(cpath, dst)
+        else:
+            rc = cd.get("retry_count", 0) + 1
+            mr = cd.get("max_retries", 3)
+            cd.update({"retry_count": rc, "error": err,
+                       "claimed_by": None, "claimed_at": None})
+            if rc >= mr:
+                cd["status"] = "FAILED"
+                clog(f"FAIL   job={job_id}  chunk={chunk_id}  (max retries {rc})", "ERROR")
+                dst = self.paths["failed"] / cpath.name.replace(claimed_suffix, "")
+                jwrite(cpath, cd); safe_mv(cpath, dst)
+            else:
+                cd["status"] = "WAITING"
+                clog(f"RETRY  job={job_id}  chunk={chunk_id}  ({rc}/{mr})", "WARN")
+                unclaimed = self.paths["queue"] / cpath.name.replace(claimed_suffix, "")
+                jwrite(cpath, cd)
+                try: os.rename(str(cpath), str(unclaimed))
+                except: safe_mv(cpath, unclaimed)
+
+    # ── Recover orphaned chunks from a previous crash ─────────────────────────
+    def recover_orphans(self):
+        q = self.paths["queue"]
+        if not q.exists(): return
+        marker = f".CLAIMED_{self.hostname}"
         try:
-            conn, addr = srv.accept()
-            threading.Thread(
-                target=handle_connection,
-                args=(conn, addr, slave),
-                daemon=True
-            ).start()
-        except socket.timeout:
-            pass
+            for f in list(q.iterdir()):
+                if f.is_file() and marker in f.name:
+                    clog(f"Recovering orphaned chunk: {f.name}", "WARN")
+                    d = jread(f, {})
+                    d.update({"claimed_by": None, "claimed_at": None,
+                               "status": "WAITING",
+                               "retry_count": d.get("retry_count", 0) + 1})
+                    unclaimed = q / f.name.replace(marker, "")
+                    jwrite(f, d)
+                    try: os.rename(str(f), str(unclaimed))
+                    except: safe_mv(f, unclaimed)
         except Exception as e:
-            if not slave._global_stop:
-                clog(f"Accept error: {e}", "ERROR")
+            clog(f"Recovery scan error: {e}", "WARN")
 
-    try: srv.close()
-    except: pass
+    # ── Main loop ─────────────────────────────────────────────────────────────
+    def run(self):
+        print()
+        print(f"  \033[97m╔══════════════════════════════════════════════════════╗\033[0m")
+        print(f"  \033[97m║       AEREN  Render Slave  v{SLAVE_VERSION}                   ║\033[0m")
+        print(f"  \033[97m║       2026 - Copyright Reserved - Praveen Brijwal    ║\033[0m")
+        print(f"  \033[97m╚══════════════════════════════════════════════════════╝\033[0m")
+        clog(f"Hostname  : {self.hostname}", "INFO")
+        clog(f"IP        : {self.ip}", "INFO")
+        clog(f"OS        : {self.os_str}", "INFO")
+        clog(f"aerender  : {self.aerender or 'NOT FOUND — renders will fail'}", "INFO" if self.aerender else "WARN")
+        clog(f"AE Ver    : {self.ae_ver or 'unknown'}", "INFO")
+        clog(f"Plugins   : {len(self.plugins)} found", "INFO")
+        clog(f"Farm root : {self.paths['root']}", "INFO")
+        print()
 
+        # Ensure dirs
+        for d in self.paths.values(): mkdir_p(d)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# BANNER
-# ══════════════════════════════════════════════════════════════════════════════
-def check_connectivity(slave) -> tuple:
-    """Test reachability to manager and verify our listen port is bindable."""
-    can_reach_mgr = False
-    try:
-        import urllib.request as _ur
-        r = _ur.urlopen(
-            f"http://{slave.manager_ip}:{MANAGER_PORT}/ping", timeout=4)
-        can_reach_mgr = (r.status == 200)
-    except Exception:
-        pass
+        # Recover any chunks left from a previous crash
+        self.recover_orphans()
 
-    # Verify our listen port isn't blocked by another process
-    srv_ok = False
-    try:
-        test = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        test.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        test.bind(("0.0.0.0", slave.listen_port))
-        test.close()
-        srv_ok = True   # port free — server will bind it
-    except OSError:
-        srv_ok = True   # port in use — means our server is already bound (good)
-    except Exception:
-        pass
+        net_ok    = True
+        last_hb   = 0.0
+        last_poll = 0.0
 
-    note = ""
-    if not can_reach_mgr:
-        note = (f"Cannot reach manager at {slave.manager_ip}:{MANAGER_PORT}. "
-                f"Check: (1) Manager is running, "
-                f"(2) --manager flag has the correct LAN IP (not localhost), "
-                f"(3) Windows Firewall allows port {MANAGER_PORT}.")
-    return can_reach_mgr, srv_ok, note
+        while not self._gstop.is_set():
+            now = time.time()
 
+            # Network check
+            try:
+                reachable = check_network(self.paths)
+            except Exception:
+                reachable = False
 
-def print_banner(slave) -> bool:
-    """Print startup banner and connectivity check. Returns True if manager reachable."""
-    ae  = slave.aerender or "NOT FOUND"
-    ps  = "installed" if HAS_PSUTIL else "NOT installed  (pip install psutil)"
+            if not reachable:
+                if net_ok:
+                    clog("Network share unreachable — render paused. Waiting...", "WARN")
+                    net_ok = False
+                time.sleep(NET_RETRY_SEC)
+                continue
+            else:
+                if not net_ok:
+                    clog("Network share restored. Resuming.", "OK")
+                    net_ok = True
 
-    can_reach_mgr, srv_ok, conn_note = check_connectivity(slave)
-    mgr_col = "\033[92m" if can_reach_mgr else "\033[91m"
-    mgr_txt = "REACHABLE" if can_reach_mgr else "UNREACHABLE"
-    srv_txt = "OK" if srv_ok else "PORT CONFLICT"
-    ip_warn = ""
-    if slave.local_ip.startswith("127."):
-        ip_warn = ("  \033[93m<-- WARNING: loopback detected. "
-                   "Manager cannot dial back. Use --ip <your_lan_ip>\033[0m")
+            # Heartbeat
+            if now - last_hb >= HB_SEC:
+                try: self.write_hb()
+                except Exception as e: clog(f"HB write failed: {e}", "WARN")
+                last_hb = now
 
-    print(f"""
-\033[97m╔══════════════════════════════════════════════════════╗
-║         AEREN  Render Slave  v{SLAVE_VERSION}                ║
-╚══════════════════════════════════════════════════════╝\033[0m
-\033[96m  Hostname      :\033[92m {slave.hostname}
-\033[96m  This Machine  :\033[92m {slave.local_ip}{ip_warn}
-\033[96m  OS            :\033[92m {slave.os_info}
-\033[96m  aerender      :\033[92m {ae}
-\033[96m  AE Version    :\033[92m {slave.ae_version}
-\033[96m  Manager       :\033[92m {slave.manager_ip}:{MANAGER_PORT}
-\033[96m  Listen Port   :\033[92m {slave.listen_port}
-\033[96m  CPU Cores     :\033[92m {cpu_cores()}
-\033[96m  RAM Total     :\033[92m {ram_total_gb()} GB
-\033[96m  Plugins found :\033[92m {len(slave.installed_plugins)}
-\033[96m  psutil        :\033[92m {ps}
+            # Stop signal check
+            try: self.check_stop_signal()
+            except: pass
 
-\033[96m  -- Network Check --
-\033[96m  Manager       : {mgr_col}{mgr_txt}\033[0m
-\033[96m  Listen port   : {"\033[92m" if srv_ok else "\033[91m"}{srv_txt}\033[0m
-\033[90m  AEREN 2026 -- Praveen Brijwal\033[0m
-""")
-    if conn_note and slave.manager_ip not in ("localhost", "127.0.0.1"):
-        print(f"  \033[91m[NETWORK ERROR] {conn_note}\033[0m\n")
-    elif not can_reach_mgr and slave.manager_ip in ("localhost", "127.0.0.1"):
-        print(f"  \033[90m[INFO] Manager not reachable via localhost — "
-              f"normal if manager starts after slave. Will keep retrying.\033[0m\n")
-    if not slave.aerender:
-        print("  \033[93m[WARN] aerender not found. Render jobs WILL fail on this node.\033[0m\n")
+            # Claim work if idle
+            if now - last_poll >= POLL_SEC:
+                last_poll = now
+                with self._lock:
+                    idle = (self.status == "IDLE")
+                if idle and (self._rthread is None or not self._rthread.is_alive()):
+                    try:
+                        result = self.claim_chunk()
+                        if result:
+                            cpath, cd = result
+                            with self._lock: self.status = "RENDERING"
+                            self._rthread = threading.Thread(
+                                target=self._render_worker,
+                                args=(cpath, cd), daemon=True)
+                            self._rthread.start()
+                    except Exception as e:
+                        clog(f"Claim error: {e}", "WARN")
 
-    return can_reach_mgr
+            time.sleep(1)
+
+        # Shutdown
+        clog("Shutting down...", "WARN")
+        try: self.write_hb("OFFLINE")
+        except: pass
 
 
-# ==============================================================================
-# ENTRY POINT
-# ==============================================================================
+# ── Entry point ───────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(
-        description="AEREN Render Slave v3.0",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples (replace 192.168.1.10 with your manager machine's LAN IP):
-  python AE_RenderSlave.py --manager 192.168.1.10
-  python AE_RenderSlave.py --manager 192.168.1.10 --name RENDER-PC-01
-  python AE_RenderSlave.py --manager 192.168.1.10 --ip 192.168.1.25
-  python AE_RenderSlave.py --manager 192.168.1.10 --port 9877
+    ap = argparse.ArgumentParser(description="AEREN Render Farm Slave v5")
+    ap.add_argument("--name", default=socket.gethostname(), help="Node display name")
+    ap.add_argument("--farm", default=FARM_ROOT,            help="Farm root UNC path")
+    args = ap.parse_args()
 
-NOTE: --manager must be the LAN IP of the manager machine.
-      Using localhost only works when both run on the same machine.
-""")
-    parser.add_argument("--manager", default="localhost",
-                        help="LAN IP of the manager machine  (e.g. 192.168.1.10)")
-    parser.add_argument("--name",    default=None,
-                        help="Override this node's display name in the Manager UI")
-    parser.add_argument("--port",    type=int, default=SLAVE_PORT,
-                        help=f"Port this slave listens on for job dispatch (default: {SLAVE_PORT})")
-    parser.add_argument("--ip",      default=None,
-                        help=("Override the IP this machine advertises to the manager. "
-                              "Use when auto-detection picks the wrong network adapter. "
-                              "Example: --ip 192.168.1.25"))
-    args = parser.parse_args()
+    slave = RenderSlave(args.name, args.farm)
 
-    # Warn clearly if --manager was not set for a multi-machine studio setup
-    if args.manager in ("localhost", "127.0.0.1"):
-        print("\033[93m" + "=" * 60)
-        print("  WARNING: --manager is set to localhost / 127.0.0.1")
-        print("  This only works if the Manager runs on THIS machine.")
-        print("  For a studio render farm, pass the Manager's LAN IP:")
-        print("    python AE_RenderSlave.py --manager 192.168.1.10")
-        print("=" * 60 + "\033[0m\n")
+    def _sig(sig, frame):
+        clog("Interrupt — shutting down...", "WARN")
+        slave._gstop.set()
+    signal.signal(signal.SIGINT, _sig)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _sig)
 
-    slave = SlaveState(
-        manager_ip = args.manager,
-        name       = args.name,
-        port       = args.port,
-    )
-
-    # Manual IP override — useful for multi-NIC machines or VPN environments
-    if args.ip:
-        slave.local_ip = args.ip
-        clog(f"IP override applied: advertising {slave.local_ip} to manager", "INFO")
-
-    # Print banner and run connectivity check
-    manager_ok = print_banner(slave)
-
-    def handle_exit(sig, frame):
-        clog(f"Signal {sig} received — shutting down.", "WARN")
-        slave.shutdown()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT,  handle_exit)
-    signal.signal(signal.SIGTERM, handle_exit)
-
-    # Start TCP server in a background thread FIRST so we are ready to accept
-    # job dispatches before registering — avoids race where manager dispatches
-    # immediately after SLAVE_CONNECT but our port isn't bound yet.
-    server_ready = threading.Event()
-
-    def _run_server_bg():
-        run_server(slave, ready_event=server_ready)
-
-    srv_thread = threading.Thread(target=_run_server_bg, daemon=False, name="tcp_server")
-    srv_thread.start()
-
-    # Wait until the TCP server has actually bound its port (up to 5s)
-    if not server_ready.wait(timeout=5):
-        clog("WARNING: TCP server did not start in time — registration may race", "WARN")
-
-    # Start heartbeat thread
-    threading.Thread(
-        target=slave.heartbeat_loop, daemon=True, name="heartbeat"
-    ).start()
-
-    # Now register with manager — server is ready to accept dispatches
-    slave.send_status({"type": "SLAVE_CONNECT"})
-    if manager_ok:
-        clog(f"Registered with manager @ {slave.manager_ip}:{MANAGER_PORT}", "OK")
-    else:
-        clog(f"Registration sent but manager unreachable — will keep retrying", "WARN")
-
-    # Wait for server thread to finish (runs until global stop)
-    srv_thread.join()
-
+    slave.run()
 
 if __name__ == "__main__":
     main()
